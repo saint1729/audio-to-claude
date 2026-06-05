@@ -16,11 +16,13 @@ import sys
 import termios
 from pathlib import Path
 
+import base64
 import pty
-import pyte
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QKeyEvent, QTextCharFormat, QTextCursor, QWheelEvent
-from PyQt6.QtCore import QMimeData
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QFont, QTextCursor
+# QtWebEngineWidgets MUST be imported before QApplication is instantiated
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -36,6 +38,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QSpinBox,
     QTextEdit,
     QToolBar,
     QVBoxLayout,
@@ -45,31 +48,6 @@ from dotenv import load_dotenv
 
 from audio_capture import AudioCapture
 from transcriber import Transcriber
-
-# ---------------------------------------------------------------------------
-# pyte named-colour → hex (VS Code terminal palette)
-# ---------------------------------------------------------------------------
-_PYTE_COLORS: dict[str, str] = {
-    # Light-terminal palette (similar to macOS Terminal "Basic" theme)
-    "default":       "#1a1a1a",
-    "black":         "#000000",
-    "red":           "#c0392b",
-    "green":         "#27ae60",
-    "brown":         "#d68910",
-    "blue":          "#2471a3",
-    "magenta":       "#8e44ad",
-    "cyan":          "#148f77",
-    "white":         "#555555",
-    "brightblack":   "#777777",
-    "brightred":     "#e74c3c",
-    "brightgreen":   "#2ecc71",
-    "brightyellow":  "#f1c40f",
-    "brightblue":    "#3498db",
-    "brightmagenta": "#9b59b6",
-    "brightcyan":    "#1abc9c",
-    "brightwhite":   "#1a1a1a",
-}
-
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -165,6 +143,7 @@ class _ZoomWatcher(QThread):
     transcript     = pyqtSignal(str)        # new formatted text block to append
     correction     = pyqtSignal(str, str)   # (old_text, new_text) in-place fix
     save_triggered = pyqtSignal(bool, str)  # (success, error_msg)
+    speaker_changed = pyqtSignal(str)       # fired whenever active speaker changes
 
     _ZOOM_DIR      = Path.home() / "Documents" / "Zoom"
     _FILENAME      = "meeting_saved_closed_caption.txt"
@@ -211,12 +190,14 @@ end tell
         super().__init__()
         self._running = True
         self._last_speaker: str = ""  # tracks speaker across poll cycles for grouping
+        self._current_file: Path | None = None
 
     def run(self) -> None:
         import time
         current_file: Path | None = None
         last_entry_count: int = 0
         last_save_time: float = 0.0
+        last_emitted_speaker: str = ""
         entries: list[tuple[str, str, str]] = []
 
         # index -> last observed text (for detecting Zoom ASR updates)
@@ -240,6 +221,7 @@ end tell
 
                     if newest != current_file:
                         current_file = newest
+                        self._current_file = newest
                         last_entry_count = 0
                         entry_texts = {}
                         emitted_texts = {}
@@ -264,6 +246,11 @@ end tell
                         self.transcript.emit(formatted)
                     for idx, (_, _, text) in enumerate(new_entries, start=last_entry_count):
                         emitted_texts[idx] = text
+                    # Fire speaker_changed if the last new entry has a different speaker
+                    last_new_speaker = new_entries[-1][0] if new_entries else ""
+                    if last_new_speaker and last_new_speaker != last_emitted_speaker:
+                        self.speaker_changed.emit(last_new_speaker)
+                        last_emitted_speaker = last_new_speaker
                     last_entry_count = n
             except Exception:
                 pass
@@ -368,212 +355,214 @@ end tell
 
         return "\n".join(result)
 
+    def get_all_formatted(self) -> str:
+        """Return the full formatted transcript for the current Zoom file."""
+        if self._current_file is None:
+            return ""
+        try:
+            raw = self._current_file.read_text(encoding="utf-8", errors="replace")
+            entries = self._parse_entries(raw)
+            saved_speaker = self._last_speaker
+            self._last_speaker = ""
+            result = self._format_entries(entries)
+            self._last_speaker = saved_speaker
+            return result
+        except Exception:
+            return ""
+
     def stop(self) -> None:
         self._running = False
 
 
 # ---------------------------------------------------------------------------
-# Smooth-scrolling text display for the terminal output
+# xterm.js HTML — loaded into QWebEngineView for a proper terminal experience
 # ---------------------------------------------------------------------------
 
-class _SmoothTextEdit(QTextEdit):
-    """Read-only QTextEdit with trackpad scrolling and direct PTY key forwarding."""
+_TERMINAL_HTML = """\
+<!DOCTYPE html><html>
+<head><meta charset="utf-8"/><style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #ffffff; overflow: hidden; }
+#terminal { width: 100%; height: 100%; }
+/* Force light scrollbar regardless of OS dark/light mode */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #f0f0f0; }
+::-webkit-scrollbar-thumb { background: #b0b0b0; border-radius: 5px; border: 2px solid #f0f0f0; }
+::-webkit-scrollbar-thumb:hover { background: #888888; }
+</style>
+<link rel="stylesheet" href="xterm.css"/>
+<script src="xterm.js"></script>
+<script src="xterm-addon-fit.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+<div id="terminal"></div>
+<script>
+var term = new Terminal({
+  fontFamily: 'Monaco, Menlo, "Courier New", monospace',
+  fontSize: 13,
+  theme: {
+    background: '#ffffff', foreground: '#1a1a1a',
+    cursor: '#1a1a1a',     cursorAccent: '#ffffff',
+    selectionBackground: '#b4d5fe',
+    black:       '#000000', red:           '#c0392b',
+    green:       '#27ae60', yellow:        '#d68910',
+    blue:        '#2471a3', magenta:       '#8e44ad',
+    cyan:        '#148f77', white:         '#555555',
+    brightBlack: '#777777', brightRed:     '#e74c3c',
+    brightGreen: '#2ecc71', brightYellow:  '#f1c40f',
+    brightBlue:  '#3498db', brightMagenta: '#9b59b6',
+    brightCyan:  '#1abc9c', brightWhite:   '#1a1a1a',
+  },
+  scrollback: 5000,
+  cursorBlink: true,
+  convertEol: false,
+});
+var fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
 
-    _KEY_MAP: dict = {
-        Qt.Key.Key_Return:   b'\r',
-        Qt.Key.Key_Enter:    b'\r',
-        Qt.Key.Key_Backspace: b'\x7f',
-        Qt.Key.Key_Tab:      b'\t',
-        Qt.Key.Key_Escape:   b'\x1b',
-        Qt.Key.Key_Up:       b'\x1b[A',
-        Qt.Key.Key_Down:     b'\x1b[B',
-        Qt.Key.Key_Right:    b'\x1b[C',
-        Qt.Key.Key_Left:     b'\x1b[D',
-        Qt.Key.Key_Home:     b'\x1b[H',
-        Qt.Key.Key_End:      b'\x1b[F',
-        Qt.Key.Key_PageUp:   b'\x1b[5~',
-        Qt.Key.Key_PageDown: b'\x1b[6~',
-        Qt.Key.Key_Delete:   b'\x1b[3~',
-    }
-    _CTRL_MAP: dict = {
-        Qt.Key.Key_C: b'\x03',
-        Qt.Key.Key_D: b'\x04',
-        Qt.Key.Key_Z: b'\x1a',
-        Qt.Key.Key_L: b'\x0c',
-        Qt.Key.Key_A: b'\x01',
-        Qt.Key.Key_E: b'\x05',
-        Qt.Key.Key_U: b'\x15',
-        Qt.Key.Key_K: b'\x0b',
-        Qt.Key.Key_W: b'\x17',
-        Qt.Key.Key_R: b'\x12',
-        Qt.Key.Key_P: b'\x10',
-        Qt.Key.Key_N: b'\x0e',
-    }
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  var bridge = channel.objects.bridge;
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+  // PTY output → xterm: Python signals base64 bytes → decode → write to terminal
+  bridge.dataFromPty.connect(function(b64) {
+    var binary = atob(b64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    term.write(bytes);
+  });
+
+  // Keyboard / paste → PTY: UTF-8 encode, base64, call Python slot
+  term.onData(function(data) {
+    var bytes = new TextEncoder().encode(data);
+    var binary = String.fromCharCode.apply(null, Array.from(bytes));
+    bridge.sendTopty(btoa(binary));
+  });
+
+  // Report size once channel is ready, then track resizes via ResizeObserver
+  fitAddon.fit();
+  bridge.resize(term.cols, term.rows);
+  var resizeTimer = null;
+  new ResizeObserver(function() {
+    // Debounce: only fit+notify after 150 ms of no further resize events.
+    // This prevents xterm.js from reflowing mid-drag and garbling the output.
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() {
+      fitAddon.fit();
+      bridge.resize(term.cols, term.rows);
+    }, 150);
+  }).observe(document.getElementById('terminal'));
+});
+</script>
+</body></html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Bridge: connects Python PTY I/O to xterm.js via QWebChannel
+# ---------------------------------------------------------------------------
+
+class _PtyBridge(QObject):
+    """Exposed to JS via QWebChannel; ferries bytes between the PTY and xterm.js."""
+    dataFromPty = pyqtSignal(str)   # base64-encoded PTY output → JS term.write()
+
+    def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        # NOT read-only so the blinking cursor is visible
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setUndoRedoEnabled(False)
-        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)  # each PTY row = one visual line
-        vsb = self.verticalScrollBar()
-        if vsb is not None:
-            vsb.setSingleStep(3)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._write_fn = None
-        self.bracketed_paste: bool = False  # set by TerminalPane when PTY enables it
+        self._master_fd: int | None = None
+        self._child_pid: int | None = None
 
-    def set_write_fn(self, fn) -> None:
-        """Register a callable(bytes) that writes raw bytes to the PTY."""
-        self._write_fn = fn
+    def set_master_fd(self, fd: int) -> None:
+        self._master_fd = fd
 
-    def wheelEvent(self, e: QWheelEvent | None) -> None:
-        if e is None:
-            return
-        pixel = e.pixelDelta()
-        if not pixel.isNull():
-            vsb = self.verticalScrollBar()
-            if vsb is not None:
-                vsb.setValue(vsb.value() - pixel.y())
-        else:
-            super().wheelEvent(e)
+    def set_child_pid(self, pid: int) -> None:
+        self._child_pid = pid
 
-    def keyPressEvent(self, e: QKeyEvent | None) -> None:
-        if e is None:
-            return
-        mods = e.modifiers()
-        key  = e.key()
-        # macOS: Qt maps ControlModifier → Command (⌘),  MetaModifier → Control (^)
-        if mods & Qt.KeyboardModifier.ControlModifier:
-            if key == Qt.Key.Key_V:
-                # Paste clipboard text directly into the PTY.
-                # Wrap in bracketed-paste sequences if the running app requested it
-                # (e.g. claude sends \x1b[?2004h to enable bracketed paste mode).
-                cb = QApplication.clipboard()
-                if cb is not None and self._write_fn is not None:
-                    text = cb.text()
-                    if text:
-                        data = text.encode('utf-8', errors='replace')
-                        if self.bracketed_paste:
-                            data = b'\x1b[200~' + data + b'\x1b[201~'
-                        self._write_fn(data)
-            else:
-                super().keyPressEvent(e)   # Cmd+C copy, Cmd+A select-all, etc.
-            return
-        if self._write_fn is None:
-            return
-        if mods & Qt.KeyboardModifier.MetaModifier:
-            data = self._CTRL_MAP.get(key)
-            if data is None:
-                text = e.text()
-                data = text.encode('utf-8') if text else None
-            if data:
-                self._write_fn(data)
-        elif key in self._KEY_MAP:
-            self._write_fn(self._KEY_MAP[key])
-        else:
-            text = e.text()
-            if text:
-                self._write_fn(text.encode('utf-8', errors='replace'))
+    @pyqtSlot(str)
+    def sendTopty(self, b64: str) -> None:
+        """Called from JS: keyboard / paste input → PTY master fd."""
+        if self._master_fd is not None:
+            try:
+                os.write(self._master_fd, base64.b64decode(b64))
+            except Exception:
+                pass
 
-    def insertFromMimeData(self, source: QMimeData | None) -> None:
-        """Forward clipboard paste (Cmd+V / drag-drop) to PTY instead of inserting."""
-        if self._write_fn and source is not None and source.hasText():
-            self._write_fn(source.text().encode('utf-8', errors='replace'))
+    @pyqtSlot(int, int)
+    def resize(self, cols: int, rows: int) -> None:
+        """Called from JS after its own debounce — apply immediately so xterm.js
+        and the PTY transition to the new size atomically (no second delay).
+        Cap at 100 cols: rich (used by claude CLI) switches to two-column panel
+        layout on wide terminals, producing confusing side-by-side output."""
+        cols = min(cols, 100)
+        if self._master_fd is not None:
+            _set_winsize(self._master_fd, rows, cols)
+        if self._child_pid is not None:
+            try:
+                import signal as _signal
+                os.kill(self._child_pid, _signal.SIGWINCH)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Right pane — embedded PTY terminal running Claude Code
+# Right pane — embedded xterm.js terminal (QWebEngineView)
 # ---------------------------------------------------------------------------
 
 class TerminalPane(QWidget):
-    _PADDING = 16  # left+right padding in stylesheet (8px each side)
+    """Right pane: a proper xterm.js terminal (QWebEngineView) backed by a PTY."""
+
+    _ASSETS = Path(__file__).parent / "assets"
 
     def __init__(self, repo_path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._master_fd: int | None = None
         self._proc: subprocess.Popen | None = None
         self._reader: _PtyReader | None = None
-        self._committed = 0
-        self._bracketed_paste: bool = False
+        self._bridge = _PtyBridge()
         self._setup_ui()
         self._start_claude(repo_path)
 
-    # ------------------------------------------------------------------
-    # Helpers to compute cols/rows from the current widget + font size
-    # ------------------------------------------------------------------
-    def _terminal_cols(self) -> int:
-        from PyQt6.QtGui import QFontMetrics
-        fm = QFontMetrics(self._output.font())
-        vp = self._output.viewport()
-        w = (vp.width() if vp is not None else self._output.width()) - self._PADDING
-        return max(80, w // max(1, fm.horizontalAdvance('M')))
-
-    def _terminal_rows(self) -> int:
-        from PyQt6.QtGui import QFontMetrics
-        fm = QFontMetrics(self._output.font())
-        vp = self._output.viewport()
-        h = (vp.height() if vp is not None else self._output.height()) - self._PADDING
-        return max(24, h // max(1, fm.height()))
-
-    def _resize_pty(self) -> None:
-        """Resize pyte screen and notify the PTY kernel of the new dimensions."""
-        cols = self._terminal_cols()
-        rows = self._terminal_rows()
-        if (cols, rows) == (self._screen.columns, self._screen.lines):
-            return
-        self._screen.resize(rows, cols)
-        if self._master_fd is not None:
-            _set_winsize(self._master_fd, rows, cols)
-        if self._proc is not None and self._proc.pid:
-            try:
-                import signal as _signal
-                os.kill(self._proc.pid, _signal.SIGWINCH)
-            except OSError:
-                pass
-
-    def resizeEvent(self, a0) -> None:  # type: ignore[override]
-        super().resizeEvent(a0)
-        self._resize_pty()
-
-    # ------------------------------------------------------------------
-
     def _setup_ui(self) -> None:
+        from PyQt6.QtCore import QUrl
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
         hdr = QLabel("  Terminal")
         hdr.setFixedHeight(28)
-        hdr.setStyleSheet("background:#e8e8e8; color:#555; font-weight:bold; border-bottom:1px solid #d0d0d0;")
+        hdr.setStyleSheet(
+            "background:#e8e8e8; color:#555; font-weight:bold;"
+            " border-bottom:1px solid #d0d0d0;"
+        )
         lay.addWidget(hdr)
 
-        self._output = _SmoothTextEdit()
-        self._output.setFont(QFont("Monaco", 13))
-        self._output.setStyleSheet(
-            "QTextEdit{background:#ffffff;color:#1a1a1a;border:none;padding:8px;}"
-        )
-        lay.addWidget(self._output)
-        # pyte screen — sized after the widget is laid out (resizeEvent fires later)
-        self._screen = pyte.HistoryScreen(120, 40, history=5000)
-        self._stream = pyte.ByteStream(self._screen)
+        self._webview = QWebEngineView()
+        lay.addWidget(self._webview)
+
+        channel = QWebChannel(self._webview.page())
+        channel.registerObject("bridge", self._bridge)
+        page = self._webview.page()
+        if page is not None:
+            page.setWebChannel(channel)
+
+        # Load xterm.js from the bundled assets/ directory (works offline)
+        base_url = QUrl.fromLocalFile(str(self._ASSETS) + "/")
+        self._webview.setHtml(_TERMINAL_HTML, base_url)
 
     def _start_claude(self, repo_path: Path) -> None:
-        cols = self._terminal_cols()
-        rows = self._terminal_rows()
-        self._screen.resize(rows, cols)
         master, slave = pty.openpty()
-        _set_winsize(slave, rows, cols)
+        _set_winsize(slave, 24, 100)
         shell = os.environ.get("SHELL", "/bin/zsh")
         env = {
             **os.environ,
             "TERM": "xterm-256color",
-            "COLUMNS": str(cols),
-            "LINES": str(rows),
+            "COLUMNS": "100",
+            "LINES": "24",
         }
         self._proc = subprocess.Popen(
-            [shell],
+            [shell, "-l"],  # login shell: sources ~/.zprofile so PATH is complete
             stdin=slave,
             stdout=slave,
             stderr=slave,
@@ -583,142 +572,43 @@ class TerminalPane(QWidget):
         )
         os.close(slave)
         self._master_fd = master
-
+        self._bridge.set_master_fd(master)
+        self._bridge.set_child_pid(self._proc.pid)
         self._reader = _PtyReader(master)
-        self._reader.data.connect(self._on_data)
+        self._reader.data.connect(self._on_pty_data)
         self._reader.start()
-        self._output.set_write_fn(self._write_bytes)
 
-    def _on_data(self, raw: bytes) -> None:
-        # Track bracketed paste mode: \x1b[?2004h = enable, \x1b[?2004l = disable
-        if b'\x1b[?2004h' in raw:
-            self._bracketed_paste = True
-            self._output.bracketed_paste = True
-        if b'\x1b[?2004l' in raw:
-            self._bracketed_paste = False
-            self._output.bracketed_paste = False
-        self._stream.feed(raw)
-        self._render()
-
-    def _render(self) -> None:
-        """Sync QTextEdit with the current pyte screen state."""
-        screen = self._screen
-        doc = self._output.document()
-        if doc is None:
-            return
-
-        # Locate block where the live screen starts
-        screen_block = doc.findBlockByNumber(self._committed)
-        start_pos = (
-            screen_block.position()
-            if screen_block.isValid()
-            else doc.characterCount() - 1
-        )
-
-        cur = QTextCursor(doc)
-        cur.setPosition(start_pos)
-        cur.movePosition(
-            QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor
-        )
-
-        self._output.setUpdatesEnabled(False)
-        try:
-            cur.removeSelectedText()
-
-            # Commit any newly scrolled-off history lines
-            hist = list(screen.history.top)
-            for i in range(self._committed, len(hist)):
-                self._render_line(cur, hist[i], screen.columns)
-                cur.insertText("\n")
-            self._committed = len(hist)
-
-            # Render the live 40-line screen
-            for y in range(screen.lines):
-                self._render_line(cur, screen.buffer[y], screen.columns)
-                if y < screen.lines - 1:
-                    cur.insertText("\n")
-        finally:
-            self._output.setUpdatesEnabled(True)
-
-        self._output.setTextCursor(cur)
-        self._output.ensureCursorVisible()
-
-        # Only reposition the caret if the user has no active text selection
-        # (preserving selection lets Cmd+C copy work without it being wiped)
-        if not self._output.textCursor().hasSelection():
-            cursor_row = self._committed + screen.cursor.y
-            cursor_col = screen.cursor.x
-            cb = doc.findBlockByNumber(cursor_row)  # type: ignore[union-attr]
-            if cb.isValid():
-                col = min(cursor_col, max(0, cb.length() - 1))
-                qt_cur = QTextCursor(doc)  # type: ignore[arg-type]
-                qt_cur.setPosition(cb.position() + col)
-                self._output.setTextCursor(qt_cur)
-            self._output.ensureCursorVisible()
-
-    def _render_line(self, cur: QTextCursor, line: dict, ncols: int) -> None:
-        """Insert one pyte Line (defaultdict col→Char) into the document."""
-        chars = [line[x] for x in range(ncols)]
-
-        # Trim trailing blank cells (default fg, default bg, space/empty)
-        last = ncols - 1
-        while last >= 0 and chars[last].data in (" ", "") \
-                and chars[last].fg == "default" and chars[last].bg == "default":
-            last -= 1
-        if last < 0:
-            return
-
-        i = 0
-        while i <= last:
-            ch = chars[i]
-            run = ch.data or " "
-            j = i + 1
-            while j <= last:
-                nch = chars[j]
-                if (nch.fg == ch.fg and nch.bg == ch.bg
-                        and nch.bold == ch.bold and nch.italics == ch.italics
-                        and nch.underscore == ch.underscore
-                        and nch.reverse == ch.reverse):
-                    run += nch.data or " "
-                    j += 1
-                else:
-                    break
-            cur.insertText(run, self._char_fmt(ch))
-            i = j
-
-    def _char_fmt(self, ch) -> QTextCharFormat:
-        fmt = QTextCharFormat()
-        fg_key = ch.bg if ch.reverse else ch.fg
-        bg_key = ch.fg if ch.reverse else ch.bg
-
-        def _hex(key: str, fallback: str) -> str:
-            return _PYTE_COLORS.get(key, key if isinstance(key, str) and key.startswith("#") else fallback)
-
-        fmt.setForeground(QColor(_hex(fg_key, "#1a1a1a")))
-        if bg_key and bg_key not in ("default", ""):
-            fmt.setBackground(QColor(_hex(bg_key, "#ffffff")))
-        if ch.bold:
-            fmt.setFontWeight(700)
-        if ch.italics:
-            fmt.setFontItalic(True)
-        if ch.underscore:
-            fmt.setFontUnderline(True)
-        return fmt
+    def _on_pty_data(self, raw: bytes) -> None:
+        self._bridge.dataFromPty.emit(base64.b64encode(raw).decode('ascii'))
 
     # Public API ------------------------------------------------------------
 
-    def _write_bytes(self, data: bytes) -> None:
-        if self._master_fd is not None:
-            os.write(self._master_fd, data)
-
     def write(self, text: str) -> None:
-        """Write a string to the PTY master."""
-        self._write_bytes(text.encode('utf-8', errors='replace'))
+        if self._master_fd is not None:
+            os.write(self._master_fd, text.encode('utf-8', errors='replace'))
 
-    def set_input(self, text: str) -> None:
-        """Send text to the PTY so it appears in the terminal (user presses Enter to submit)."""
-        self._write_bytes(text.encode('utf-8', errors='replace'))
-        self._output.setFocus()
+    def set_input(self, text: str, grab_focus: bool = False) -> None:
+        """Send text to the PTY so it appears in the terminal input line."""
+        if self._master_fd is not None:
+            os.write(self._master_fd, text.encode('utf-8', errors='replace'))
+        if grab_focus:
+            self._webview.setFocus()
+
+    def send_and_submit(self, text: str) -> None:
+        """Send text to the PTY then press Enter after a short delay so the
+        TUI app (Claude Code) has time to register the full input first."""
+        if self._master_fd is not None:
+            os.write(self._master_fd, text.encode('utf-8', errors='replace'))
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(150, self._send_enter)
+        self._webview.setFocus()
+
+    def _send_enter(self) -> None:
+        if self._master_fd is not None:
+            try:
+                os.write(self._master_fd, b'\r')
+            except OSError:
+                pass
 
     def closeEvent(self, a0) -> None:
         try:
@@ -738,6 +628,7 @@ class TerminalPane(QWidget):
 
 class TranscriptPane(QWidget):
     source_changed = pyqtSignal(str)  # "microphone" or "zoom"
+    load_all_clicked = pyqtSignal()
 
     def __init__(self, terminal: TerminalPane, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -750,73 +641,234 @@ class TranscriptPane(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Header bar
+        _hdr_bg = "background:#e8e8e8; border-bottom:1px solid #d0d0d0;"
+        _act_bg = "background:#f4f4f4; border-bottom:1px solid #d0d0d0;"
+        _btn_style = (
+            "QPushButton{{background:{bg};color:#fff;border:none;"
+            "padding:0 4px;border-radius:3px;font-size:11px;font-weight:bold;}}"
+            "QPushButton:hover{{background:{hov};}}"
+            "QPushButton:pressed{{background:{pr};}}"
+        )
+
+        def _btn(label, tip, bg, hov, pr):
+            b = QPushButton(label)
+            b.setFixedHeight(22)
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.setToolTip(tip)
+            b.setStyleSheet(_btn_style.format(bg=bg, hov=hov, pr=pr))
+            return b
+
+        # ── Row 1: title + source combo ──────────────────────────────────────
         hdr = QWidget()
         hdr.setFixedHeight(28)
-        hdr.setStyleSheet("background:#e8e8e8; border-bottom:1px solid #d0d0d0;")
+        hdr.setStyleSheet(_hdr_bg)
         hdr_lay = QHBoxLayout(hdr)
-        hdr_lay.setContentsMargins(8, 0, 8, 0)
-
-        lbl = QLabel("Live Transcript")
-        lbl.setStyleSheet("color:#555; font-weight:bold;")
+        hdr_lay.setContentsMargins(6, 0, 6, 0)
+        hdr_lay.setSpacing(4)
+        lbl = QLabel("Transcript")
+        lbl.setStyleSheet("color:#555; font-weight:bold; font-size:12px;")
         hdr_lay.addWidget(lbl)
         hdr_lay.addStretch()
 
-        # Source selector
         self._source_combo = QComboBox()
         self._source_combo.addItems(["Zoom", "Microphone"])
-        # Disable the Microphone item (grayed out)
         from PyQt6.QtGui import QStandardItemModel
         combo_model = self._source_combo.model()
         if isinstance(combo_model, QStandardItemModel):
             mic_item = combo_model.item(1)
             if mic_item is not None:
                 mic_item.setFlags(mic_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-        self._source_combo.setCurrentIndex(0)  # default to Zoom
+        self._source_combo.setCurrentIndex(0)
         self._source_combo.setFixedHeight(22)
+        self._source_combo.setMinimumWidth(0)
         self._source_combo.setToolTip("Choose transcription source")
         self._source_combo.setStyleSheet(
-            "QComboBox{border:1px solid #bbb;border-radius:3px;padding:0 6px;"
-            "background:#fff;color:#333;font-size:12px;}"
-            "QComboBox::drop-down{width:18px;}"
+            "QComboBox{border:1px solid #bbb;border-radius:3px;padding:0 4px;"
+            "background:#fff;color:#333;font-size:11px;}"
+            "QComboBox::drop-down{width:14px;}"
         )
         self._source_combo.currentTextChanged.connect(
             lambda t: self.source_changed.emit(t.lower())
         )
         hdr_lay.addWidget(self._source_combo)
-
-        self._btn = QPushButton("Insert")
-        self._btn.setFixedHeight(22)
-        self._btn.setToolTip("Insert selected text (or all text) into Claude Code input")
-        self._btn.setStyleSheet(
-            "QPushButton{background:#0078d4;color:#fff;border:none;"
-            "padding:0 14px;border-radius:3px;font-weight:bold;}"
-            "QPushButton:hover{background:#106ebe;}"
-            "QPushButton:pressed{background:#005a9e;}"
-        )
-        self._btn.clicked.connect(self._on_insert)
-        hdr_lay.addWidget(self._btn)
-
-        self._save_btn = QPushButton("Save")
-        self._save_btn.setFixedHeight(22)
-        self._save_btn.setToolTip("Save transcript to a text file")
-        self._save_btn.setStyleSheet(
-            "QPushButton{background:#5a9e5a;color:#fff;border:none;"
-            "padding:0 14px;border-radius:3px;font-weight:bold;}"
-            "QPushButton:hover{background:#4a8a4a;}"
-            "QPushButton:pressed{background:#3a7a3a;}"
-        )
-        self._save_btn.clicked.connect(self._on_save)
-        hdr_lay.addWidget(self._save_btn)
         lay.addWidget(hdr)
 
+        # ── Row 2: Interviewee name ───────────────────────────────────────────
+        row_ee = QWidget()
+        row_ee.setFixedHeight(28)
+        row_ee.setStyleSheet(_act_bg)
+        r_ee = QHBoxLayout(row_ee)
+        r_ee.setContentsMargins(4, 3, 4, 3)
+        r_ee.setSpacing(4)
+        ee_name_lbl = QLabel("Interviewee:")
+        ee_name_lbl.setStyleSheet("color:#555; font-size:11px;")
+        ee_name_lbl.setFixedWidth(70)
+        r_ee.addWidget(ee_name_lbl)
+        self._ee_name_edit = QLineEdit(os.getenv("INTERVIEWEE_SPEAKER_NAME", "Interviewee"))
+        self._ee_name_edit.setFixedHeight(22)
+        self._ee_name_edit.setPlaceholderText("Zoom display name…")
+        self._ee_name_edit.setStyleSheet(
+            "QLineEdit{border:1px solid #bbb;border-radius:3px;padding:0 4px;"
+            "background:#fff;color:#333;font-size:11px;}"
+            "QLineEdit:focus{border:1px solid #0078d4;}"
+        )
+        self._ee_name_edit.setToolTip("Zoom display name of the Interviewee (for volume ducking)")
+        self._ee_name_edit.textChanged.connect(
+            lambda v: os.environ.__setitem__("INTERVIEWEE_SPEAKER_NAME", v.strip())
+        )
+        r_ee.addWidget(self._ee_name_edit)
+        lay.addWidget(row_ee)
+
+        # ── Row 3: Insert + Save ─────────────────────────────────────────────
+        row2 = QWidget()
+        row2.setFixedHeight(28)
+        row2.setStyleSheet(_act_bg)
+        r2 = QHBoxLayout(row2)
+        r2.setContentsMargins(4, 3, 4, 3)
+        r2.setSpacing(3)
+        self._btn = _btn("Insert", "Insert selected/all text into Claude input",
+                         "#0078d4", "#106ebe", "#005a9e")
+        self._btn.clicked.connect(self._on_insert)
+        r2.addWidget(self._btn)
+        self._save_btn = _btn("Save", "Save transcript to a file",
+                              "#5a9e5a", "#4a8a4a", "#3a7a3a")
+        self._save_btn.clicked.connect(self._on_save)
+        r2.addWidget(self._save_btn)
+        lay.addWidget(row2)
+
+        # ── Row 3: Ask + Clear + Load ────────────────────────────────────────
+        row3 = QWidget()
+        row3.setFixedHeight(28)
+        row3.setStyleSheet(_act_bg)
+        r3 = QHBoxLayout(row3)
+        r3.setContentsMargins(4, 3, 4, 3)
+        r3.setSpacing(3)
+        ask_btn = _btn("Ask", "Send transcript to Claude and submit immediately",
+                       "#0078d4", "#106ebe", "#005a9e")
+        ask_btn.clicked.connect(self._on_insert_all_and_ask)
+        r3.addWidget(ask_btn)
+        clear_btn = _btn("Clear", "Clear transcript pane",
+                         "#c0392b", "#a93226", "#922b21")
+        clear_btn.clicked.connect(self._on_clear_all)
+        r3.addWidget(clear_btn)
+        load_btn = _btn("Load", "Load full Zoom transcript",
+                        "#5a9e5a", "#4a8a4a", "#3a7a3a")
+        load_btn.clicked.connect(self.load_all_clicked)
+        r3.addWidget(load_btn)
+        lay.addWidget(row3)
+
+        # ── Row N: Zoom output device picker (full-width) ────────────────────
+        row4 = QWidget()
+        row4.setFixedHeight(28)
+        row4.setStyleSheet(_act_bg)
+        r4 = QHBoxLayout(row4)
+        r4.setContentsMargins(4, 3, 4, 3)
+        r4.setSpacing(4)
+        dev_lbl = QLabel("Out:")
+        dev_lbl.setStyleSheet("color:#555; font-size:11px;")
+        dev_lbl.setFixedWidth(26)
+        r4.addWidget(dev_lbl)
+        self._dev_combo = QComboBox()
+        self._dev_combo.setMinimumWidth(0)
+        self._dev_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._dev_combo.setFixedHeight(22)
+        self._dev_combo.setEditable(False)
+        self._dev_combo.setToolTip("Zoom output device whose volume is adjusted")
+        self._dev_combo.setStyleSheet(
+            "QComboBox{border:1px solid #bbb;border-radius:3px;padding:0 4px;"
+            "background:#fff;color:#333;font-size:11px;}"
+            "QComboBox::drop-down{width:14px;}"
+        )
+        _out_devices = _list_output_device_names()
+        self._dev_combo.addItem("(none)")
+        for dn in _out_devices:
+            self._dev_combo.addItem(dn)
+        cur_dev = os.getenv("ZOOM_OUTPUT_DEVICE", "")
+        _dev_idx = self._dev_combo.findText(cur_dev)
+        if _dev_idx >= 0:
+            self._dev_combo.setCurrentIndex(_dev_idx)
+        elif _out_devices:
+            # default to first real device
+            self._dev_combo.setCurrentIndex(1)
+            os.environ["ZOOM_OUTPUT_DEVICE"] = _out_devices[0]
+        self._dev_combo.currentTextChanged.connect(self._on_dev_changed)
+        r4.addWidget(self._dev_combo)
+        lay.addWidget(row4)
+
+        # ── Row N+1: Interviewee volume ───────────────────────────────────────
+        row_vol = QWidget()
+        row_vol.setFixedHeight(28)
+        row_vol.setStyleSheet(_act_bg)
+        r_vol = QHBoxLayout(row_vol)
+        r_vol.setContentsMargins(4, 3, 4, 3)
+        r_vol.setSpacing(4)
+        vol_lbl = QLabel("Interviewee Vol:")
+        vol_lbl.setStyleSheet("color:#555; font-size:11px;")
+        vol_lbl.setFixedWidth(90)
+        r_vol.addWidget(vol_lbl)
+        self._ee_vol_spin = QSpinBox()
+        self._ee_vol_spin.setRange(0, 100)
+        self._ee_vol_spin.setSuffix("%")
+        self._ee_vol_spin.setValue(int(os.getenv("INTERVIEWEE_VOLUME", "5")))
+        self._ee_vol_spin.setFixedHeight(22)
+        self._ee_vol_spin.setFixedWidth(60)
+        self._ee_vol_spin.setToolTip("Volume % when Interviewee is speaking")
+        self._ee_vol_spin.setStyleSheet(
+            "QSpinBox{border:1px solid #bbb;border-radius:3px;padding:0 2px;"
+            "background:#fff;color:#333;font-size:11px;}"
+        )
+        self._ee_vol_spin.valueChanged.connect(
+            lambda v: os.environ.__setitem__("INTERVIEWEE_VOLUME", str(v))
+        )
+        r_vol.addWidget(self._ee_vol_spin)
+        r_vol.addStretch()
+        lay.addWidget(row_vol)
+
+        # ── Text area ────────────────────────────────────────────────────────
         self._edit = QTextEdit()
         self._edit.setFont(QFont("Helvetica Neue", 14))
         self._edit.setStyleSheet(
             "QTextEdit{background:#ffffff;color:#1a1a1a;border:none;padding:12px;}"
+            "QScrollBar:vertical{background:#f0f0f0;width:10px;border-radius:5px;}"
+            "QScrollBar::handle:vertical{background:#b0b0b0;border-radius:5px;min-height:20px;}"
+            "QScrollBar::handle:vertical:hover{background:#888888;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}"
+            "QScrollBar:horizontal{background:#f0f0f0;height:10px;border-radius:5px;}"
+            "QScrollBar::handle:horizontal{background:#b0b0b0;border-radius:5px;min-width:20px;}"
+            "QScrollBar::handle:horizontal:hover{background:#888888;}"
+            "QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0px;}"
         )
         self._edit.setPlaceholderText("Transcription will appear here in real-time…")
         lay.addWidget(self._edit)
+
+        # ── Question input row ───────────────────────────────────────────────
+        q_wrap = QWidget()
+        q_wrap.setStyleSheet("background:#f4f4f4; border-top:1px solid #d0d0d0;")
+        q_lay = QHBoxLayout(q_wrap)
+        q_lay.setContentsMargins(4, 4, 4, 4)
+        q_lay.setSpacing(4)
+        self._question_input = QLineEdit()
+        self._question_input.setPlaceholderText("Question + Enter…")
+        self._question_input.setFixedHeight(26)
+        self._question_input.setStyleSheet(
+            "QLineEdit{background:#fff;color:#1a1a1a;border:1px solid #bbb;"
+            "border-radius:4px;padding:0 6px;font-size:12px;}"
+            "QLineEdit:focus{border:1px solid #0078d4;}"
+        )
+        self._question_input.returnPressed.connect(self._on_send_to_claude)
+        q_lay.addWidget(self._question_input)
+        send_btn = _btn("Send", "Send transcript + question to Claude",
+                        "#0078d4", "#106ebe", "#005a9e")
+        send_btn.setFixedHeight(26)
+        send_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        send_btn.setFixedWidth(44)
+        send_btn.clicked.connect(self._on_send_to_claude)
+        q_lay.addWidget(send_btn)
+        lay.addWidget(q_wrap)
+
+    def _on_dev_changed(self, name: str) -> None:
+        os.environ["ZOOM_OUTPUT_DEVICE"] = "" if name == "(none)" else name.strip()
 
     def append(self, text: str) -> None:
         import time
@@ -854,8 +906,25 @@ class TranscriptPane(QWidget):
 
         end_cur = QTextCursor(self._edit.document())
         end_cur.movePosition(QTextCursor.MoveOperation.End)
-        prefix = "\n\n" if self._edit.toPlainText() else ""
-        end_cur.insertText(prefix + text)
+
+        doc_text = self._edit.toPlainText()
+        has_content = bool(doc_text.strip())
+
+        # Strip the trailing blank padding left by the previous append so the
+        # gap only ever appears once at the very end, not between entries.
+        trailing = len(doc_text) - len(doc_text.rstrip('\n'))
+        if trailing > 0:
+            end_cur.movePosition(
+                QTextCursor.MoveOperation.Left,
+                QTextCursor.MoveMode.KeepAnchor,
+                trailing,
+            )
+            end_cur.removeSelectedText()
+
+        prefix = "\n\n" if has_content else ""
+        # 8 blank lines at the end so the latest entry sits comfortably above
+        # the bottom edge without having to scroll all the way down.
+        end_cur.insertText(prefix + text + "\n" * 16)
 
         if had_selection:
             sel.setPosition(anchor, QTextCursor.MoveMode.MoveAnchor)
@@ -906,6 +975,52 @@ class TranscriptPane(QWidget):
         if sb is not None:
             sb.setValue(scroll_val)
 
+    def _on_insert_all_and_ask(self) -> None:
+        """Send entire transcript to Claude terminal and submit immediately."""
+        import re as _re
+        transcript = self._edit.toPlainText().strip()
+        if not transcript:
+            return
+        normalized = _re.sub(r"\s+", " ", transcript).strip()
+        self._terminal.send_and_submit(normalized)
+        self._edit.clear()
+        self._last_append = 0.0
+
+    def _on_clear_all(self) -> None:
+        """Clear the transcript pane. The Zoom watcher keeps its position so
+        only new entries (after the next Zoom save) will appear."""
+        self._edit.clear()
+        self._last_append = 0.0
+
+    def _on_send_to_claude(self) -> None:
+        """Combine transcript + question, send to Claude terminal, then reset transcript."""
+        import re as _re
+        transcript = self._edit.toPlainText().strip()
+        question = self._question_input.text().strip()
+
+        if not transcript and not question:
+            return
+
+        # Normalize transcript: collapse multiple whitespace/newlines into a
+        # single space so the whole thing lands on one terminal input line.
+        normalized = _re.sub(r"\s+", " ", transcript).strip()
+
+        if normalized and question:
+            message = f"{normalized} {question}"
+        elif normalized:
+            message = normalized
+        else:
+            message = question
+
+        self._terminal.send_and_submit(message)
+
+        # Clear transcript so the next capture starts fresh
+        self._edit.clear()
+        self._last_append = 0.0
+
+        # Clear the question field and return focus to the terminal
+        self._question_input.clear()
+
     def _on_save(self) -> None:
         text = self._edit.toPlainText().strip()
         if not text:
@@ -920,7 +1035,7 @@ class TranscriptPane(QWidget):
         cur = self._edit.textCursor()
         text = cur.selectedText().strip() or self._edit.toPlainText().strip()
         if text:
-            self._terminal.set_input(text)
+            self._terminal.set_input(text, grab_focus=True)
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +1054,23 @@ _SETTINGS_FIELDS = [
     ("TRANSCRIPTION_MODEL",          "Transcription Model",               False),
     ("TRANSCRIPTION_CONTEXT_CHARS",  "Transcription Context (chars)",     False),
 ]
+
+
+def _list_output_device_names() -> list[str]:
+    """Return names of all output-capable audio devices via sounddevice."""
+    try:
+        import sounddevice as sd
+        seen: set[str] = set()
+        names: list[str] = []
+        for device in sd.query_devices():
+            if device.get("max_output_channels", 0) > 0:
+                name = str(device.get("name", "")).strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
+    except Exception:
+        return []
 
 
 class SettingsDialog(QDialog):
@@ -1037,16 +1169,17 @@ class App(QMainWindow):
         super().__init__()
         self._app_support = app_support
         self.setWindowTitle("audio-to-claude")
-        self.resize(1440, 860)
+        self.resize(900, 860)
+        self.setFixedWidth(900)
         self.setStyleSheet("QMainWindow{background:#f0f0f0;}")
 
         self._term = TerminalPane(repo_path=repo_path)
         self._trans = TranscriptPane(terminal=self._term)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._trans)
         splitter.addWidget(self._term)
-        splitter.setSizes([480, 960])
+        splitter.addWidget(self._trans)
+        splitter.setSizes([765, 135])
         splitter.setHandleWidth(2)
         splitter.setStyleSheet("QSplitter::handle{background:#d0d0d0;}")
         self.setCentralWidget(splitter)
@@ -1079,7 +1212,9 @@ class App(QMainWindow):
         # Don't start the audio worker — Zoom is the default source
 
         self._zoom_watcher: _ZoomWatcher | None = None
+        self._restore_vol: int | None = None  # volume to restore when interviewee stops speaking
         self._trans.source_changed.connect(self._on_source_changed)
+        self._trans.load_all_clicked.connect(self._on_load_all)
         # Start in Zoom mode immediately
         self._on_source_changed("zoom")
 
@@ -1092,15 +1227,24 @@ class App(QMainWindow):
             )
         self._refresh_status()
 
+    def _on_load_all(self) -> None:
+        """Load the full Zoom transcript into the pane."""
+        if self._zoom_watcher is not None:
+            content = self._zoom_watcher.get_all_formatted()
+            if content:
+                self._trans.set_content(content)
+
     def _status_text(self) -> str:
-        device    = os.getenv("AUDIO_DEVICE_NAME", "—")
-        chunk     = os.getenv("CHUNK_SECONDS", "—")
-        max_chunk = os.getenv("MAX_CHUNK_SECONDS", "—")
-        sil_dur   = os.getenv("SILENCE_DURATION", "—")
-        provider  = os.getenv("TRANSCRIPTION_PROVIDER", "—")
-        model     = os.getenv("TRANSCRIPTION_MODEL", "—")
+        device       = os.getenv("AUDIO_DEVICE_NAME", "—")
+        chunk        = os.getenv("CHUNK_SECONDS", "—")
+        max_chunk    = os.getenv("MAX_CHUNK_SECONDS", "—")
+        sil_dur      = os.getenv("SILENCE_DURATION", "—")
+        provider     = os.getenv("TRANSCRIPTION_PROVIDER", "—")
+        model        = os.getenv("TRANSCRIPTION_MODEL", "—")
+        cur_vol      = self._get_system_volume()
         return (
-            f"  Device: {device}   •   Chunk: {chunk}–{max_chunk}s   •   "
+            f"  Vol: {cur_vol}%   •   "
+            f"Device: {device}   •   Chunk: {chunk}\u2013{max_chunk}s   •   "
             f"Silence: {sil_dur}s   •   Provider: {provider}   •   Model: {model}"
         )
 
@@ -1114,6 +1258,185 @@ class App(QMainWindow):
         dlg.exec()
         self._refresh_status()  # update bar after any saves
 
+    @staticmethod
+    def _coreaudio_device_id(device_name: str) -> "int | None":
+        """Return the CoreAudio AudioObjectID for the first output device whose
+        name contains `device_name` (case-insensitive), or None if not found."""
+        import ctypes
+        ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+        UInt32 = ctypes.c_uint32
+        c_void_p = ctypes.c_void_p
+
+        class _Addr(ctypes.Structure):
+            _fields_ = [("sel", UInt32), ("scope", UInt32), ("elem", UInt32)]
+
+        kSysObj            = 1
+        kDevices           = 0x64657623  # 'dev#'
+        kScopeGlobal       = 0x676c6f62  # 'glob'
+        kScopeOutput       = 0x6f757470  # 'outp'
+        kElemMain          = 0
+        kDevNameCF         = 0x6c6e616d  # 'lnam'
+        kCFStringEncodingUTF8 = 0x08000100
+
+        addr = _Addr(kDevices, kScopeGlobal, kElemMain)
+        data_size = UInt32(0)
+        ca.AudioObjectGetPropertyDataSize(UInt32(kSysObj), ctypes.byref(addr),
+                                          UInt32(0), None, ctypes.byref(data_size))
+        n = data_size.value // ctypes.sizeof(UInt32)
+        ids = (UInt32 * n)()
+        ca.AudioObjectGetPropertyData(UInt32(kSysObj), ctypes.byref(addr),
+                                      UInt32(0), None, ctypes.byref(data_size), ids)
+
+        for dev_id in ids:
+            name_addr = _Addr(kDevNameCF, kScopeGlobal, kElemMain)
+            cf_str = c_void_p(0)
+            str_size = UInt32(ctypes.sizeof(c_void_p))
+            ca.AudioObjectGetPropertyData(UInt32(dev_id), ctypes.byref(name_addr),
+                                          UInt32(0), None, ctypes.byref(str_size),
+                                          ctypes.byref(cf_str))
+            if not cf_str.value:
+                continue
+            buf_len = cf.CFStringGetMaximumSizeForEncoding(cf_str, kCFStringEncodingUTF8) + 1
+            buf = ctypes.create_string_buffer(buf_len)
+            cf.CFStringGetCString(cf_str, buf, buf_len, kCFStringEncodingUTF8)
+            cf.CFRelease(cf_str)
+            name = buf.value.decode("utf-8", errors="replace")
+            if device_name.lower() in name.lower():
+                return int(dev_id)
+        return None
+
+    @staticmethod
+    def _get_device_volume(device_name: str) -> str:
+        """Read the output volume (0-100) of a named CoreAudio device, or '—'."""
+        try:
+            import ctypes
+            ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+            UInt32 = ctypes.c_uint32
+            Float32 = ctypes.c_float
+
+            class _Addr(ctypes.Structure):
+                _fields_ = [("sel", UInt32), ("scope", UInt32), ("elem", UInt32)]
+
+            kVolScalar = 0x766f6c6d  # 'volm'
+            kScopeOutput = 0x6f757470
+            kElemMain = 0
+
+            dev_id = App._coreaudio_device_id(device_name)
+            if dev_id is None:
+                return "—"
+
+            vol_addr = _Addr(kVolScalar, kScopeOutput, kElemMain)
+            vol = Float32(0.0)
+            size = UInt32(ctypes.sizeof(Float32))
+            ret = ca.AudioObjectGetPropertyData(UInt32(dev_id), ctypes.byref(vol_addr),
+                                                UInt32(0), None, ctypes.byref(size),
+                                                ctypes.byref(vol))
+            if ret != 0:
+                # Try channel 1 if master not available
+                vol_addr = _Addr(kVolScalar, kScopeOutput, 1)
+                ca.AudioObjectGetPropertyData(UInt32(dev_id), ctypes.byref(vol_addr),
+                                              UInt32(0), None, ctypes.byref(size),
+                                              ctypes.byref(vol))
+            return str(round(vol.value * 100))
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _set_device_volume(device_name: str, volume_pct: int) -> None:
+        """Set the output volume (0-100) of a named CoreAudio device."""
+        try:
+            import ctypes
+            ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+            UInt32 = ctypes.c_uint32
+            Float32 = ctypes.c_float
+
+            class _Addr(ctypes.Structure):
+                _fields_ = [("sel", UInt32), ("scope", UInt32), ("elem", UInt32)]
+
+            kVolScalar   = 0x766f6c6d  # 'volm'
+            kScopeOutput = 0x6f757470  # 'outp'
+
+            dev_id = App._coreaudio_device_id(device_name)
+            if dev_id is None:
+                print(f"[volume] device '{device_name}' not found", flush=True)
+                return
+
+            scalar = Float32(max(0.0, min(1.0, volume_pct / 100.0)))
+            size   = UInt32(ctypes.sizeof(Float32))
+
+            # Try master (element 0) first, then channels 1 & 2
+            for elem in (0, 1, 2):
+                vol_addr = _Addr(kVolScalar, kScopeOutput, elem)
+                settable = ctypes.c_bool(False)
+                ca.AudioObjectIsPropertySettable(UInt32(dev_id), ctypes.byref(vol_addr),
+                                                 ctypes.byref(settable))
+                if settable.value:
+                    ca.AudioObjectSetPropertyData(UInt32(dev_id), ctypes.byref(vol_addr),
+                                                  UInt32(0), None, size,
+                                                  ctypes.byref(scalar))
+        except Exception as exc:
+            print(f"[volume] CoreAudio error: {exc}", flush=True)
+
+    def _get_system_volume(self) -> str:
+        """Return current volume for status bar display."""
+        try:
+            return str(self._read_volume())
+        except Exception:
+            return "—"
+
+    def _set_volume(self, vol_pct: int) -> None:
+        """Set volume via CoreAudio (if device configured) or osascript fallback."""
+        device = os.getenv("ZOOM_OUTPUT_DEVICE", "").strip()
+        if device:
+            self._set_device_volume(device, vol_pct)
+        else:
+            try:
+                subprocess.Popen(
+                    ["osascript", "-e", f"set volume output volume {vol_pct}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                print(f"[volume] osascript: {exc}", flush=True)
+
+    def _read_volume(self) -> int:
+        """Read current volume via CoreAudio (if device configured) or osascript fallback."""
+        device = os.getenv("ZOOM_OUTPUT_DEVICE", "").strip()
+        if device:
+            v = self._get_device_volume(device)
+            if v != "—":
+                try:
+                    return int(v)
+                except ValueError:
+                    pass
+        # osascript fallback
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", "output volume of (get volume settings)"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return int(result.stdout.strip())
+        except Exception:
+            return 100
+
+    def _on_speaker_changed_volume(self, speaker: str) -> None:
+        """Adjust volume based on who is speaking."""
+        interviewee = os.getenv("INTERVIEWEE_SPEAKER_NAME", "Interviewee").strip()
+        if speaker.strip().lower() == interviewee.lower():
+            # Save current volume before ducking
+            self._restore_vol = self._read_volume()
+            vol = max(0, min(100, int(os.getenv("INTERVIEWEE_VOLUME", "5"))))
+        else:
+            # Only restore if we previously ducked this session
+            if self._restore_vol is None:
+                return
+            vol = self._restore_vol
+        self._set_volume(vol)
+        # Refresh status bar to reflect new volume
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(200, self._refresh_status)
+
     def _on_zoom_save_triggered(self, ok: bool, err: str) -> None:
         """Update status bar with the result of the latest Save Transcript attempt."""
         import datetime
@@ -1126,9 +1449,14 @@ class App(QMainWindow):
             status = f"error: {err}"
         else:
             status = "no-op"
+        interviewee = os.getenv("INTERVIEWEE_SPEAKER_NAME", "Interviewee")
+        ee_vol      = os.getenv("INTERVIEWEE_VOLUME", "5")
+        cur_vol     = self._get_system_volume()
         sb = self.statusBar()
         if sb is not None:
-            sb.showMessage(f"  Source: Zoom   •   Last save: {ts} ({status})")
+            sb.showMessage(
+                f"  Vol: {cur_vol}%   •   Last save: {ts} ({status})   •   Source: Zoom"
+            )
 
     def _on_source_changed(self, source: str) -> None:
         """Switch between microphone and Zoom transcript sources."""
@@ -1142,10 +1470,16 @@ class App(QMainWindow):
                 self._zoom_watcher.transcript.connect(self._trans.append_block)
                 self._zoom_watcher.correction.connect(self._trans.correct)
                 self._zoom_watcher.save_triggered.connect(self._on_zoom_save_triggered)
+                self._zoom_watcher.speaker_changed.connect(self._on_speaker_changed_volume)
                 self._zoom_watcher.start()
             sb = self.statusBar()
             if sb is not None:
-                sb.showMessage("  Source: Zoom   •   Waiting for first save…")
+                interviewee = os.getenv("INTERVIEWEE_SPEAKER_NAME", "Interviewee")
+                ee_vol      = os.getenv("INTERVIEWEE_VOLUME", "5")
+                cur_vol     = self._get_system_volume()
+                sb.showMessage(
+                    f"  Vol: {cur_vol}%   •   Waiting for first save…   •   Source: Zoom"
+                )
         else:  # microphone
             # Stop Zoom watcher
             if self._zoom_watcher is not None:
