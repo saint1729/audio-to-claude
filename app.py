@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -461,6 +463,174 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
 
 
 # ---------------------------------------------------------------------------
+# Rich UI HTML — markdown + mermaid + syntax-highlighted chat renderer.
+# Loaded into a QWebEngineView; fed Claude's streamed markdown via QWebChannel.
+# All three libraries are vendored in assets/ so this works fully offline,
+# mirroring the bundled-xterm.js approach used by the terminal pane.
+# ---------------------------------------------------------------------------
+
+_RICH_HTML = """\
+<!DOCTYPE html><html>
+<head><meta charset="utf-8"/>
+<link rel="stylesheet" href="github.min.css"/>
+<style>
+* { box-sizing: border-box; }
+html, body { margin:0; padding:0; height:100%; background:#ffffff; color:#1a1a1a;
+  font-family:-apple-system,'Helvetica Neue',Helvetica,Arial,sans-serif; font-size:14px; }
+#chat { height:100%; overflow-y:auto; padding:14px 16px 28px; }
+.msg { margin:0 0 16px; max-width:100%; }
+.msg .role { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+  margin-bottom:4px; color:#888; }
+.msg.user { }
+.msg.user .role { color:#0078d4; }
+.msg.user .body { background:#eaf3fb; border:1px solid #d4e6f6; border-radius:10px;
+  padding:8px 12px; white-space:pre-wrap; word-wrap:break-word; }
+.msg.assistant .role { color:#7a4ed4; }
+.msg.assistant .answer { background:#fafafa; border:1px solid #ececec; border-radius:10px;
+  padding:2px 14px; }
+.thinking { margin:0 0 6px; border-left:3px solid #e0d4f5; background:#faf7ff;
+  border-radius:0 6px 6px 0; }
+.thinking-label { cursor:pointer; font-size:11px; color:#9a7fd0; font-weight:700;
+  padding:5px 10px; user-select:none; }
+.thinking-body { display:none; padding:0 10px 8px 10px; font-size:12px; color:#7d7d7d;
+  white-space:pre-wrap; word-wrap:break-word; font-family:Monaco,Menlo,monospace; }
+.thinking.open .thinking-body { display:block; }
+.tools { display:flex; flex-wrap:wrap; gap:5px; margin:0 0 6px; }
+.tool-chip { font-size:11px; background:#f0f0f0; border:1px solid #e0e0e0; border-radius:12px;
+  padding:2px 9px; color:#555; font-family:Monaco,Menlo,monospace; }
+.tool-chip b { color:#148f77; font-weight:700; }
+/* markdown body styling */
+.answer h1,.answer h2,.answer h3,.answer h4 { line-height:1.25; margin:14px 0 8px; }
+.answer h1 { font-size:1.5em; border-bottom:1px solid #eee; padding-bottom:.2em; }
+.answer h2 { font-size:1.3em; border-bottom:1px solid #f0f0f0; padding-bottom:.2em; }
+.answer h3 { font-size:1.12em; } .answer h4 { font-size:1em; }
+.answer p { margin:8px 0; line-height:1.55; }
+.answer ul,.answer ol { margin:8px 0; padding-left:24px; line-height:1.5; }
+.answer li { margin:3px 0; }
+.answer a { color:#0078d4; text-decoration:none; } .answer a:hover { text-decoration:underline; }
+.answer code { background:#f0f0f2; border-radius:4px; padding:1px 5px; font-size:.88em;
+  font-family:Monaco,Menlo,'Courier New',monospace; }
+.answer pre { background:#f6f8fa; border:1px solid #ececec; border-radius:8px; padding:12px;
+  overflow-x:auto; margin:10px 0; }
+.answer pre code { background:none; padding:0; font-size:12.5px; }
+.answer blockquote { border-left:3px solid #ddd; margin:8px 0; padding:2px 12px; color:#666; }
+.answer table { border-collapse:collapse; margin:10px 0; font-size:13px; }
+.answer th,.answer td { border:1px solid #e0e0e0; padding:5px 10px; text-align:left; }
+.answer th { background:#f6f8fa; font-weight:700; }
+.answer .mermaid { background:#fff; text-align:center; margin:12px 0; }
+.answer .mermaid svg { max-width:100%; height:auto; }
+.empty { color:#bbb; text-align:center; margin-top:40px; font-size:13px; }
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-track { background:#f0f0f0; }
+::-webkit-scrollbar-thumb { background:#b0b0b0; border-radius:5px; border:2px solid #f0f0f0; }
+::-webkit-scrollbar-thumb:hover { background:#888; }
+</style>
+<script src="markdown-it.min.js"></script>
+<script src="highlight.min.js"></script>
+<script src="mermaid.min.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+<div id="chat"><div class="empty" id="empty">Ask Claude anything — answers render here with rich formatting and diagrams.</div></div>
+<script>
+var md = window.markdownit({ html:false, linkify:true, typographer:false });
+try { mermaid.initialize({ startOnLoad:false, theme:'default', securityLevel:'strict' }); } catch(e){}
+var chat = document.getElementById('chat');
+var buffers = {};   // msg id -> accumulated raw markdown answer text
+
+function nearBottom() { return chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 50; }
+function stick(was) { if (was) chat.scrollTop = chat.scrollHeight; }
+function dropEmpty() { var e=document.getElementById('empty'); if(e) e.remove(); }
+function esc(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+function clearChat() {
+  chat.innerHTML = '<div class="empty" id="empty">Ask Claude anything — answers render here with rich formatting and diagrams.</div>';
+  buffers = {};
+}
+
+function addUser(text) {
+  dropEmpty(); var was = nearBottom();
+  var m = document.createElement('div'); m.className = 'msg user';
+  m.innerHTML = '<div class="role">You</div><div class="body"></div>';
+  m.querySelector('.body').textContent = text;
+  chat.appendChild(m); stick(true);
+}
+
+function beginAssistant(id) {
+  dropEmpty(); var was = nearBottom();
+  buffers[id] = '';
+  var m = document.createElement('div'); m.className = 'msg assistant'; m.id = 'm-'+id;
+  m.innerHTML =
+    '<div class="role">Claude</div>' +
+    '<div class="thinking" style="display:none"><div class="thinking-label">&#128173; Thinking (click to expand)</div><div class="thinking-body"></div></div>' +
+    '<div class="tools" style="display:none"></div>' +
+    '<div class="answer"></div>';
+  var th = m.querySelector('.thinking-label');
+  th.addEventListener('click', function(){ m.querySelector('.thinking').classList.toggle('open'); });
+  chat.appendChild(m); stick(was);
+}
+
+function onThinking(id, chunk) {
+  var m = document.getElementById('m-'+id); if(!m) return; var was = nearBottom();
+  var box = m.querySelector('.thinking'); box.style.display = 'block';
+  m.querySelector('.thinking-body').textContent += chunk; stick(was);
+}
+
+function onToolUse(id, name, summary) {
+  var m = document.getElementById('m-'+id); if(!m) return; var was = nearBottom();
+  var tools = m.querySelector('.tools'); tools.style.display = 'flex';
+  var chip = document.createElement('span'); chip.className = 'tool-chip';
+  chip.innerHTML = '&#128295; <b>' + esc(name) + '</b>' + (summary ? ' ' + esc(summary) : '');
+  tools.appendChild(chip); stick(was);
+}
+
+function onDelta(id, chunk) {
+  var m = document.getElementById('m-'+id); if(!m) return; var was = nearBottom();
+  buffers[id] = (buffers[id] || '') + chunk;
+  m.querySelector('.answer').innerHTML = md.render(buffers[id]);   // live, plain (no mermaid yet)
+  stick(was);
+}
+
+function convertMermaid(container) {
+  // markdown-it renders ```mermaid as <pre><code class="language-mermaid">; swap for a .mermaid div
+  container.querySelectorAll('code.language-mermaid').forEach(function(code){
+    var pre = code.parentElement;
+    var div = document.createElement('div'); div.className = 'mermaid';
+    div.textContent = code.textContent;
+    if (pre && pre.parentElement) pre.parentElement.replaceChild(div, pre);
+  });
+}
+
+function onDone(id, fullMd) {
+  var m = document.getElementById('m-'+id); if(!m) return; var was = nearBottom();
+  var ans = m.querySelector('.answer');
+  ans.innerHTML = md.render(fullMd && fullMd.length ? fullMd : (buffers[id] || ''));
+  convertMermaid(ans);
+  ans.querySelectorAll('pre code').forEach(function(c){ try { hljs.highlightElement(c); } catch(e){} });
+  var nodes = ans.querySelectorAll('.mermaid');
+  if (nodes.length) {
+    try { mermaid.run({ nodes: Array.prototype.slice.call(nodes), suppressErrors:true }); }
+    catch(e) { console.error('mermaid', e); }
+  }
+  stick(was);
+}
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  var b = channel.objects.bridge;
+  b.clearChat.connect(clearChat);
+  b.userBubble.connect(addUser);
+  b.assistantBegin.connect(beginAssistant);
+  b.thinkingDelta.connect(onThinking);
+  b.toolUse.connect(onToolUse);
+  b.assistantDelta.connect(onDelta);
+  b.assistantDone.connect(onDone);
+});
+</script>
+</body></html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Bridge: connects Python PTY I/O to xterm.js via QWebChannel
 # ---------------------------------------------------------------------------
 
@@ -623,6 +793,921 @@ class TerminalPane(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Rich UI — headless `claude -p` stream worker + QWebEngineView renderer
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Permission store — persists per-tool allow/deny choices across sessions
+# ---------------------------------------------------------------------------
+
+_ALL_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep",
+              "WebFetch", "WebSearch", "TodoWrite", "Agent"]
+
+_PERMISSIONS_FILE = Path.home() / ".claude" / "audio-to-claude-permissions.json"
+
+
+def _load_permissions() -> dict[str, bool]:
+    """Return {tool_name: allowed} from disk, defaulting all unknown tools to False."""
+    try:
+        if _PERMISSIONS_FILE.exists():
+            import json as _j
+            data = _j.loads(_PERMISSIONS_FILE.read_text())
+            if isinstance(data, dict):
+                return {str(k): bool(v) for k, v in data.items()}
+    except Exception:
+        pass
+    # Defaults: read-only tools on, everything else off
+    return {t: t in ("Read", "Glob", "Grep") for t in _ALL_TOOLS}
+
+
+def _save_permissions(perms: dict[str, bool]) -> None:
+    try:
+        import json as _j
+        _PERMISSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PERMISSIONS_FILE.write_text(_j.dumps(perms, indent=2))
+    except Exception:
+        pass
+
+
+class _PermissionDialog(QDialog):
+    """VS Code-style 'Claude wants to use tools' pre-send dialog."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Allow Tools")
+        self.setMinimumWidth(360)
+
+        self._perms = _load_permissions()
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        lbl = QLabel("Which tools should Claude be allowed to use?")
+        lbl.setStyleSheet("font-size:12px; color:#333;")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self._checks: dict[str, "QCheckBox"] = {}
+        from PyQt6.QtWidgets import QCheckBox, QGroupBox, QGridLayout
+        grid = QGroupBox()
+        grid.setStyleSheet(
+            "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;padding:8px 6px;}"
+        )
+        gl = QGridLayout(grid)
+        gl.setSpacing(4)
+        for i, tool in enumerate(_ALL_TOOLS):
+            cb = QCheckBox(tool)
+            cb.setChecked(self._perms.get(tool, False))
+            cb.setStyleSheet("font-size:12px;")
+            gl.addWidget(cb, i // 2, i % 2)
+            self._checks[tool] = cb
+        lay.addWidget(grid)
+
+        from PyQt6.QtWidgets import QCheckBox as _CB
+        self._remember = _CB("Remember my choices for future sessions")
+        self._remember.setChecked(True)
+        self._remember.setStyleSheet("font-size:11px; color:#555;")
+        lay.addWidget(self._remember)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._on_ok)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _on_ok(self) -> None:
+        for tool, cb in self._checks.items():
+            self._perms[tool] = cb.isChecked()
+        if self._remember.isChecked():
+            _save_permissions(self._perms)
+        self.accept()
+
+    def allowed_tools(self) -> list[str]:
+        return [t for t, cb in self._checks.items() if cb.isChecked()]
+
+
+class _ClaudeStreamWorker(QThread):
+    """Runs `claude -p ... --output-format stream-json` and parses the NDJSON
+    event stream into Qt signals. One worker per prompt; multi-turn continuity
+    is preserved by passing the previous session_id via --resume."""
+
+    began      = pyqtSignal()              # process launched
+    session    = pyqtSignal(str)           # session_id (from init or result)
+    thinking   = pyqtSignal(str)           # extended-thinking delta
+    tool       = pyqtSignal(str, str)      # (tool_name, short summary)
+    delta      = pyqtSignal(str)           # assistant answer text delta
+    done       = pyqtSignal(str)           # final clean markdown (result field)
+    failed     = pyqtSignal(str)           # human-readable error
+
+    def __init__(self, prompt: str, cwd: Path, resume_sid: str | None,
+                 effort: str | None = None,
+                 allowed_tools: list[str] | None = None) -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._cwd = cwd
+        self._resume_sid = resume_sid
+        self._effort = effort
+        self._allowed_tools = allowed_tools or ["Read", "Glob", "Grep"]
+        self._proc: subprocess.Popen | None = None
+
+    def stop(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        import json
+        claude = _which_claude()
+        cmd = [
+            claude, "-p", self._prompt,
+            "--output-format", "stream-json",
+            "--include-partial-messages", "--verbose",
+            "--allowed-tools", *self._allowed_tools,
+        ]
+        if self._resume_sid:
+            cmd += ["--resume", self._resume_sid]
+        if self._effort:
+            cmd += ["--effort", self._effort]
+        env = {**os.environ, "TERM": "dumb"}
+        try:
+            self._proc = subprocess.Popen(
+                cmd, cwd=str(self._cwd), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            self.failed.emit(
+                f"Could not find the 'claude' CLI (tried: {claude}).\n"
+                "Install it from https://claude.com/download, or set "
+                "CLAUDE_CLI_PATH=/full/path/to/claude in the app's .env "
+                "(~/Library/Application Support/audio-to-claude/.env)."
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"Could not launch claude: {exc}")
+            return
+
+        self.began.emit()
+        final_result: str | None = None
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._handle(evt)
+            if evt.get("type") == "result":
+                final_result = evt.get("result") or ""
+                sid = evt.get("session_id")
+                if sid:
+                    self.session.emit(sid)
+
+        rc = self._proc.wait()
+        if final_result is not None:
+            self.done.emit(final_result)
+        elif rc != 0:
+            err = ""
+            if self._proc.stderr is not None:
+                err = (self._proc.stderr.read() or "").strip()
+            self.failed.emit(err[:500] or f"claude exited with code {rc}")
+        else:
+            # Stream ended cleanly but no result event — emit whatever we have.
+            self.done.emit("")
+
+    def _handle(self, evt: dict) -> None:
+        etype = evt.get("type")
+        if etype == "system" and evt.get("subtype") == "init":
+            sid = evt.get("session_id")
+            if sid:
+                self.session.emit(sid)
+            return
+        if etype == "stream_event":
+            inner = evt.get("event") or {}
+            itype = inner.get("type")
+            if itype == "content_block_delta":
+                d = inner.get("delta") or {}
+                dt = d.get("type")
+                if dt == "text_delta" and d.get("text"):
+                    self.delta.emit(d["text"])
+                elif dt == "thinking_delta" and d.get("thinking"):
+                    self.thinking.emit(d["thinking"])
+            elif itype == "content_block_start":
+                cb = inner.get("content_block") or {}
+                if cb.get("type") == "tool_use":
+                    self.tool.emit(str(cb.get("name") or "tool"), "")
+            return
+        if etype == "assistant":
+            # Catch tool_use blocks that arrive only in the assembled message.
+            msg = evt.get("message") or {}
+            for blk in msg.get("content", []):
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    self.tool.emit(str(blk.get("name") or "tool"),
+                                   _summarize_tool_input(blk.get("input")))
+
+
+class _ClaudeBridge(QObject):
+    """Exposed to the Rich UI webview; pushes streamed render events into JS."""
+    clearChat      = pyqtSignal()
+    userBubble     = pyqtSignal(str)
+    assistantBegin = pyqtSignal(str)
+    thinkingDelta  = pyqtSignal(str, str)
+    toolUse        = pyqtSignal(str, str, str)
+    assistantDelta = pyqtSignal(str, str)
+    assistantDone  = pyqtSignal(str, str)
+
+
+def _summarize_tool_input(inp) -> str:
+    """One-line hint for a tool chip (e.g. the path being read)."""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("file_path", "path", "pattern", "command", "query", "url"):
+        val = inp.get(key)
+        if val:
+            s = str(val)
+            return s if len(s) <= 60 else s[:57] + "…"
+    return ""
+
+
+_CLAUDE_PATH_CACHE: str | None = None
+
+
+def _sessions_dir_for(cwd: Path) -> Path:
+    """Return the ~/.claude/projects/<encoded> directory for a given working path."""
+    encoded = str(cwd.resolve()).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / encoded
+
+
+def _load_session_messages(session_id: str, cwd: Path) -> list[tuple[str, str, list[str]]]:
+    """Parse a session JSONL and return [(role, text, tool_names), ...].
+
+    role is 'user' or 'assistant'. tool_names lists tool_use block names for
+    assistant turns. User turns that contain only tool_result content (internal
+    plumbing) are skipped so only real user messages are shown.
+
+    The JSONL format has top-level `type` of "user"/"assistant" with the actual
+    message nested under the `message` key.
+    """
+    import json as _json
+
+    sessions_dir = _sessions_dir_for(cwd)
+    jf = sessions_dir / f"{session_id}.jsonl"
+    if not jf.exists():
+        return []
+
+    messages: list[tuple[str, str, list[str]]] = []
+    with jf.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                evt = _json.loads(raw)
+            except Exception:
+                continue
+
+            role = evt.get("type")  # top-level "type" is "user" or "assistant"
+            if role not in ("user", "assistant"):
+                continue
+
+            # Content lives inside evt["message"]["content"]
+            msg = evt.get("message") or {}
+            content = msg.get("content", "")
+
+            text_parts: list[str] = []
+            tool_names: list[str] = []
+            has_real_user_text = False
+
+            if isinstance(content, str):
+                text_parts.append(content)
+                has_real_user_text = True
+            elif isinstance(content, list):
+                for blk in content:
+                    if not isinstance(blk, dict):
+                        continue
+                    btype = blk.get("type")
+                    if btype == "text":
+                        t = blk.get("text", "").strip()
+                        if t:
+                            text_parts.append(t)
+                            has_real_user_text = True
+                    elif btype == "thinking":
+                        pass  # skip thinking blocks in history replay
+                    elif btype == "tool_use":
+                        tool_names.append(str(blk.get("name") or "tool"))
+                    # tool_result blocks are internal plumbing — not surfaced
+
+            if role == "user" and not has_real_user_text:
+                continue  # skip internal tool-result-only turns
+
+            text = "\n\n".join(text_parts).strip()
+            if text or tool_names:
+                messages.append((role, text, tool_names))
+
+    return messages
+
+
+def _load_sessions(cwd: Path) -> list[dict]:
+    """Return session metadata dicts for all JSONL sessions under cwd, newest first.
+
+    Each dict has: session_id, preview (first user text, truncated), ts (mtime float),
+    message_count.
+    """
+    import json as _json
+
+    sessions_dir = _sessions_dir_for(cwd)
+    if not sessions_dir.is_dir():
+        return []
+
+    results: list[dict] = []
+    for jf in sessions_dir.glob("*.jsonl"):
+        try:
+            ts = jf.stat().st_mtime
+            preview = ""
+            msg_count = 0
+            with jf.open(encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        evt = _json.loads(raw)
+                    except Exception:
+                        continue
+                    # top-level "type" is "user" or "assistant"
+                    role = evt.get("type")
+                    if role in ("user", "assistant"):
+                        msg_count += 1
+                    # Grab first user text as preview
+                    if not preview and role == "user":
+                        msg = evt.get("message") or {}
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            preview = content
+                        elif isinstance(content, list):
+                            for blk in content:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    preview = blk.get("text", "")
+                                    break
+                        preview = " ".join(preview.split())[:120]
+            results.append({
+                "session_id": jf.stem,
+                "preview": preview or "(no preview)",
+                "ts": ts,
+                "message_count": msg_count,
+            })
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x["ts"], reverse=True)
+    return results
+
+
+class _HistoryDialog(QDialog):
+    """Pick a past Claude Code session to resume."""
+
+    session_selected = pyqtSignal(str)   # session_id
+
+    def __init__(self, cwd: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Session History")
+        self.setMinimumSize(520, 360)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        lbl = QLabel(f"Sessions for:  {cwd}")
+        lbl.setStyleSheet("color:#555; font-size:11px;")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            "QListWidget{border:1px solid #d0d0d0;border-radius:4px;background:#fff;}"
+            "QListWidget::item{padding:6px 8px;border-bottom:1px solid #f0f0f0;}"
+            "QListWidget::item:selected{background:#eaf3fb;color:#1a1a1a;}"
+        )
+        self._list.itemDoubleClicked.connect(self._accept)
+        lay.addWidget(self._list)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self._sessions = _load_sessions(cwd)
+        if self._sessions:
+            import datetime
+            for s in self._sessions:
+                dt = datetime.datetime.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M")
+                label = f"{dt}  •  {s['message_count']} msgs  •  {s['session_id']}  —  {s['preview']}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, s["session_id"])
+                self._list.addItem(item)
+            self._list.setCurrentRow(0)
+        else:
+            item = QListWidgetItem("No sessions found for this directory.")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self._list.addItem(item)
+
+    def _accept(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            return
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if sid:
+            self.session_selected.emit(sid)
+            self.accept()
+
+
+def _which_claude() -> str:
+    """Resolve the claude binary once. A GUI app launched from Finder/.app
+    inherits only a minimal PATH (/usr/bin:/bin:...), not the user's interactive
+    PATH, so shutil.which() often misses claude. We therefore also honour an
+    explicit override, check common install locations, and finally ask a login
+    shell (which sources ~/.zprofile) where claude lives — the same trick the
+    terminal pane uses successfully."""
+    global _CLAUDE_PATH_CACHE
+    if _CLAUDE_PATH_CACHE:
+        return _CLAUDE_PATH_CACHE
+    import shutil
+
+    # 1) Explicit override (set CLAUDE_CLI_PATH in the app-support .env).
+    override = os.environ.get("CLAUDE_CLI_PATH", "").strip()
+    if override:
+        cand = Path(override).expanduser()
+        if cand.exists():
+            _CLAUDE_PATH_CACHE = str(cand)
+            return _CLAUDE_PATH_CACHE
+
+    # 2) Current process PATH.
+    found = shutil.which("claude")
+
+    # 3) Common install locations across installers/managers.
+    if not found:
+        cands = [
+            Path.home() / ".local" / "bin" / "claude",     # native installer (current)
+            Path.home() / ".claude" / "local" / "claude",  # native installer (legacy)
+            Path.home() / ".toolbox" / "bin" / "claude",    # Amazon toolbox
+            Path("/opt/homebrew/bin/claude"),               # Homebrew (Apple Silicon)
+            Path("/usr/local/bin/claude"),                  # Homebrew (Intel) / manual
+            Path.home() / ".npm-global" / "bin" / "claude", # npm global prefix
+        ]
+        # nvm installs node (and global bins like claude) under a per-version
+        # dir; glob every installed version. Prefer the highest version string.
+        nvm_bins = sorted(
+            (Path.home() / ".nvm" / "versions" / "node").glob("*/bin/claude"),
+            reverse=True,
+        )
+        cands.extend(nvm_bins)
+        for cand in cands:
+            if cand.exists():
+                found = str(cand)
+                break
+
+    # 4) Last resort: ask an interactive login shell where claude lives. Must be
+    #    interactive (-i) because version managers like nvm initialise in
+    #    ~/.zshrc, which non-interactive shells do NOT source — so a plain
+    #    `zsh -l -c` would miss an nvm-installed claude. Pick the last stdout
+    #    line that is a real path.
+    if not found:
+        try:
+            shell = os.environ.get("SHELL", "/bin/zsh")
+            out = subprocess.run(
+                [shell, "-lic", "command -v claude"],
+                capture_output=True, text=True, timeout=15,
+            )
+            for line in reversed(out.stdout.splitlines()):
+                line = line.strip()
+                if line and Path(line).exists():
+                    found = line
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
+    _CLAUDE_PATH_CACHE = found or "claude"
+    return _CLAUDE_PATH_CACHE
+
+
+class _PromptTextEdit(QTextEdit):
+    """Multi-line prompt box: Enter submits, Shift+Enter inserts a newline."""
+    submitted = pyqtSignal()
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        if e is not None and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(e)            # Shift+Enter → newline
+            else:
+                self.submitted.emit()               # Enter → send
+            return
+        super().keyPressEvent(e)
+
+
+class RichClaudePane(QWidget):
+    """Rich UI mode: renders Claude's markdown answers (with mermaid diagrams and
+    syntax-highlighted code) via a QWebEngineView. Driven by headless `claude -p`,
+    reusing the same CLI + auth the terminal uses. Multi-turn within this pane is
+    preserved via --resume; it is a separate conversation from the Terminal pane.
+
+    A header row exposes the working directory (with Browse) and an Effort level;
+    both apply to the headless claude invocations. A multi-line prompt box at the
+    bottom composes questions (Enter sends, Shift+Enter for a newline)."""
+
+    _ASSETS = Path(__file__).parent / "assets"
+
+    # Effort dropdown labels → --effort value (None = CLI default)
+    _EFFORT_LEVELS = [("Default", None), ("Low", "low"), ("Medium", "medium"),
+                      ("High", "high"), ("Max", "max")]
+
+    def __init__(self, repo_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._cwd = repo_path
+        self._effort: str | None = None
+        self._bridge = _ClaudeBridge()
+        self._worker: _ClaudeStreamWorker | None = None
+        self._session_id: str | None = None
+        self._msg_seq = 0
+        self._cur_id: str | None = None
+        self._ready = False
+        self._pending: str | None = None     # prompt queued until webview loads
+        self._busy = False
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        from PyQt6.QtCore import QUrl
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Header: working dir + Browse + effort level ──────────────────────
+        ctl = QWidget()
+        ctl.setFixedHeight(30)
+        ctl.setStyleSheet("background:#f4f4f4; border-bottom:1px solid #d0d0d0;")
+        c = QHBoxLayout(ctl)
+        c.setContentsMargins(6, 3, 6, 3)
+        c.setSpacing(5)
+
+        dir_lbl = QLabel("Dir:")
+        dir_lbl.setStyleSheet("color:#555; font-size:11px;")
+        c.addWidget(dir_lbl)
+        self._dir_edit = QLineEdit(str(self._cwd))
+        self._dir_edit.setFixedHeight(22)
+        self._dir_edit.setToolTip("Working directory for Claude (Rich UI). Edit and press Enter, or Browse.")
+        self._dir_edit.setStyleSheet(
+            "QLineEdit{border:1px solid #bbb;border-radius:3px;padding:0 5px;"
+            "background:#fff;color:#333;font-size:11px;}"
+            "QLineEdit:focus{border:1px solid #0078d4;}"
+        )
+        self._dir_edit.editingFinished.connect(self._on_dir_edited)
+        c.addWidget(self._dir_edit, 1)
+
+        browse = QPushButton("Browse…")
+        browse.setFixedHeight(22)
+        browse.setStyleSheet(
+            "QPushButton{background:#e0e0e0;border:1px solid #bbb;border-radius:3px;"
+            "padding:0 8px;font-size:11px;color:#333;}QPushButton:hover{background:#d4d4d4;}"
+        )
+        browse.clicked.connect(self._on_browse_dir)
+        c.addWidget(browse)
+
+        eff_lbl = QLabel("Effort:")
+        eff_lbl.setStyleSheet("color:#555; font-size:11px;")
+        c.addWidget(eff_lbl)
+        self._effort_combo = QComboBox()
+        for label, _ in self._EFFORT_LEVELS:
+            self._effort_combo.addItem(label)
+        self._effort_combo.setFixedHeight(22)
+        self._effort_combo.setToolTip("Reasoning effort for Claude (maps to --effort)")
+        self._effort_combo.setStyleSheet(
+            "QComboBox{border:1px solid #bbb;border-radius:3px;padding:0 5px;"
+            "background:#fff;color:#333;font-size:11px;}QComboBox::drop-down{width:14px;}"
+        )
+        self._effort_combo.currentIndexChanged.connect(self._on_effort_changed)
+        c.addWidget(self._effort_combo)
+        lay.addWidget(ctl)
+
+        # ── Chat surface ─────────────────────────────────────────────────────
+        self._webview = QWebEngineView()
+        lay.addWidget(self._webview, 1)
+
+        channel = QWebChannel(self._webview.page())
+        channel.registerObject("bridge", self._bridge)
+        page = self._webview.page()
+        if page is not None:
+            page.setWebChannel(channel)
+            page.loadFinished.connect(self._on_loaded)
+
+        base_url = QUrl.fromLocalFile(str(self._ASSETS) + "/")
+        self._webview.setHtml(_RICH_HTML, base_url)
+
+        # ── Prompt input: multi-line textarea + Send ─────────────────────────
+        inp = QWidget()
+        inp.setStyleSheet("background:#f4f4f4; border-top:1px solid #d0d0d0;")
+        i = QHBoxLayout(inp)
+        i.setContentsMargins(6, 6, 6, 6)
+        i.setSpacing(5)
+        self._prompt_edit = _PromptTextEdit()
+        self._prompt_edit.setFixedHeight(60)
+        self._prompt_edit.setPlaceholderText("Ask Claude…  (Enter to send, Shift+Enter for newline)")
+        self._prompt_edit.setStyleSheet(
+            "QTextEdit{background:#fff;color:#1a1a1a;border:1px solid #bbb;"
+            "border-radius:4px;padding:4px 6px;font-size:13px;}"
+            "QTextEdit:focus{border:1px solid #0078d4;}"
+        )
+        self._prompt_edit.submitted.connect(self._on_prompt_submitted)
+        i.addWidget(self._prompt_edit, 1)
+        self._send_btn = QPushButton("Send")
+        self._send_btn.setFixedWidth(56)
+        self._send_btn.setFixedHeight(60)
+        self._send_btn.setStyleSheet(
+            "QPushButton{background:#0078d4;color:#fff;border:none;border-radius:4px;"
+            "font-size:12px;font-weight:bold;}QPushButton:hover{background:#106ebe;}"
+            "QPushButton:pressed{background:#005a9e;}QPushButton:disabled{background:#9bbfdc;}"
+        )
+        self._send_btn.clicked.connect(self._on_prompt_submitted)
+        i.addWidget(self._send_btn)
+        # Continue: fires a fixed "Please continue further" prompt so the user can
+        # nudge Claude onward without retyping. Context for the prompt is set elsewhere.
+        self._continue_btn = QPushButton("Continue")
+        self._continue_btn.setFixedWidth(72)
+        self._continue_btn.setFixedHeight(60)
+        self._continue_btn.setToolTip("Ask Claude to continue further")
+        self._continue_btn.setStyleSheet(
+            "QPushButton{background:#5a9e5a;color:#fff;border:none;border-radius:4px;"
+            "font-size:12px;font-weight:bold;}QPushButton:hover{background:#4a8a4a;}"
+            "QPushButton:pressed{background:#3a7a3a;}QPushButton:disabled{background:#aacaaa;}"
+        )
+        self._continue_btn.clicked.connect(self._on_continue)
+        i.addWidget(self._continue_btn)
+        lay.addWidget(inp)
+
+    def _on_dir_edited(self) -> None:
+        raw = self._dir_edit.text().strip()
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            self._cwd = p.resolve()
+            self._dir_edit.setText(str(self._cwd))
+        else:
+            # revert to the last valid directory rather than launch claude in a bad cwd
+            self._dir_edit.setText(str(self._cwd))
+
+    def _on_browse_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Working Directory", str(self._cwd))
+        if chosen:
+            self._cwd = Path(chosen).resolve()
+            self._dir_edit.setText(str(self._cwd))
+
+    def _on_effort_changed(self, idx: int) -> None:
+        if 0 <= idx < len(self._EFFORT_LEVELS):
+            self._effort = self._EFFORT_LEVELS[idx][1]
+
+    def _on_prompt_submitted(self) -> None:
+        text = self._prompt_edit.toPlainText().strip()
+        if not text or self._busy:
+            return
+        self._prompt_edit.clear()
+        self.send_and_submit(text)
+
+    def _on_continue(self) -> None:
+        """Send a fixed 'Please continue further' prompt and submit immediately."""
+        if self._busy:
+            return
+        self.send_and_submit("Please continue further")
+
+    def _on_loaded(self, ok: bool) -> None:
+        self._ready = True
+        if self._pending is not None:
+            prompt, self._pending = self._pending, None
+            self._ask(prompt)
+
+    # Public API — mirrors TerminalPane so LeftPane can route uniformly --------
+
+    def send_and_submit(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        if not self._ready:
+            self._pending = text
+            return
+        self._ask(text)
+
+    def set_input(self, text: str, grab_focus: bool = False) -> None:
+        # Rich UI has no editable input line; treat Insert like a submit.
+        self.send_and_submit(text)
+        if grab_focus:
+            self._webview.setFocus()
+
+    def _ask(self, prompt: str) -> None:
+        if self._busy:
+            return  # one in-flight query at a time keeps the UX legible
+
+        # Show permission dialog only on the first turn of a session,
+        # or if no remembered preferences exist yet.
+        if self._session_id is None or not _PERMISSIONS_FILE.exists():
+            dlg = _PermissionDialog(self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            allowed_tools = dlg.allowed_tools() or ["Read"]
+        else:
+            allowed_tools = [t for t, v in _load_permissions().items() if v] or ["Read"]
+
+        self._busy = True
+        self._send_btn.setEnabled(False)
+        self._continue_btn.setEnabled(False)
+        self._bridge.userBubble.emit(prompt)
+        self._msg_seq += 1
+        self._cur_id = str(self._msg_seq)
+        self._bridge.assistantBegin.emit(self._cur_id)
+
+        self._worker = _ClaudeStreamWorker(
+            prompt, self._cwd, self._session_id, effort=self._effort,
+            allowed_tools=allowed_tools)
+        self._worker.session.connect(self._on_session)
+        self._worker.thinking.connect(lambda t: self._cur_id and self._bridge.thinkingDelta.emit(self._cur_id, t))
+        self._worker.tool.connect(lambda n, s: self._cur_id and self._bridge.toolUse.emit(self._cur_id, n, s))
+        self._worker.delta.connect(lambda t: self._cur_id and self._bridge.assistantDelta.emit(self._cur_id, t))
+        self._worker.done.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_session(self, sid: str) -> None:
+        self._session_id = sid
+
+    def _on_done(self, full_md: str) -> None:
+        if self._cur_id:
+            self._bridge.assistantDone.emit(self._cur_id, full_md)
+        self._busy = False
+        self._send_btn.setEnabled(True)
+        self._continue_btn.setEnabled(True)
+
+    def _on_failed(self, msg: str) -> None:
+        if self._cur_id:
+            self._bridge.assistantDone.emit(
+                self._cur_id, f"⚠️ **Claude error**\n\n```\n{msg}\n```")
+        self._busy = False
+        self._send_btn.setEnabled(True)
+        self._continue_btn.setEnabled(True)
+
+    def clear(self) -> None:
+        """Reset the visible chat and start a fresh conversation."""
+        self._session_id = None
+        self._bridge.clearChat.emit()
+
+    def resume_session(self, session_id: str) -> None:
+        """Clear the chat view, replay history from the session file, then resume."""
+        self._session_id = session_id
+        self._bridge.clearChat.emit()
+
+        messages = _load_session_messages(session_id, self._cwd)
+        for role, text, tool_names in messages:
+            if role == "user":
+                self._bridge.userBubble.emit(text)
+            else:
+                self._msg_seq += 1
+                mid = str(self._msg_seq)
+                self._bridge.assistantBegin.emit(mid)
+                for tname in tool_names:
+                    self._bridge.toolUse.emit(mid, tname, "")
+                self._bridge.assistantDone.emit(mid, text)
+
+    def closeEvent(self, a0) -> None:
+        try:
+            if self._worker and self._worker.isRunning():
+                self._worker.stop()
+                self._worker.wait(1000)
+        except Exception:
+            pass
+        super().closeEvent(a0)
+
+
+# ---------------------------------------------------------------------------
+# Left pane — mode switcher wrapping Rich UI (default) and Terminal
+# ---------------------------------------------------------------------------
+
+class LeftPane(QWidget):
+    """Hosts the two left-pane modes behind a top dropdown:
+      • Rich UI (default) — markdown/mermaid rendering via headless claude
+      • Terminal          — the existing interactive xterm.js + PTY session
+    Exposes send_and_submit / set_input, dispatching to the active mode so the
+    transcript pane's Insert/Ask/Send buttons work the same in either view."""
+
+    def __init__(self, repo_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._terminal = TerminalPane(repo_path=repo_path)
+        self._rich = RichClaudePane(repo_path=repo_path)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        hdr = QWidget()
+        hdr.setFixedHeight(28)
+        hdr.setStyleSheet("background:#e8e8e8; border-bottom:1px solid #d0d0d0;")
+        h = QHBoxLayout(hdr)
+        h.setContentsMargins(6, 0, 6, 0)
+        h.setSpacing(6)
+        lbl = QLabel("View:")
+        lbl.setStyleSheet("color:#555; font-weight:bold; font-size:12px;")
+        h.addWidget(lbl)
+        self._mode = QComboBox()
+        self._mode.addItems(["Rich UI", "Terminal"])     # index 0 = default
+        self._mode.setFixedHeight(22)
+        self._mode.setToolTip("Rich UI renders markdown + mermaid; Terminal is the interactive Claude CLI")
+        self._mode.setStyleSheet(
+            "QComboBox{border:1px solid #bbb;border-radius:3px;padding:0 6px;"
+            "background:#fff;color:#333;font-size:11px;}"
+            "QComboBox::drop-down{width:14px;}"
+        )
+        self._mode.currentIndexChanged.connect(self._on_mode_changed)
+        h.addWidget(self._mode)
+        h.addStretch()
+
+        _hbtn_style = (
+            "QPushButton{background:#e0e0e0;border:1px solid #bbb;border-radius:3px;"
+            "padding:0 8px;font-size:11px;color:#333;}"
+            "QPushButton:hover{background:#d0d0d0;}"
+        )
+        history_btn = QPushButton("History")
+        history_btn.setFixedHeight(22)
+        history_btn.setToolTip("Browse past sessions for this directory and resume one")
+        history_btn.setStyleSheet(_hbtn_style)
+        history_btn.clicked.connect(self._on_history)
+        h.addWidget(history_btn)
+
+        new_btn = QPushButton("New Session")
+        new_btn.setFixedHeight(22)
+        new_btn.setToolTip("Clear the current chat and start a fresh Claude session")
+        new_btn.setStyleSheet(_hbtn_style)
+        new_btn.clicked.connect(self._on_new_session)
+        h.addWidget(new_btn)
+
+        perms_btn = QPushButton("Permissions…")
+        perms_btn.setFixedHeight(22)
+        perms_btn.setToolTip("Edit which tools Claude is allowed to use")
+        perms_btn.setStyleSheet(_hbtn_style)
+        perms_btn.clicked.connect(self._on_permissions)
+        h.addWidget(perms_btn)
+
+        lay.addWidget(hdr)
+
+        from PyQt6.QtWidgets import QStackedWidget
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._rich)       # index 0
+        self._stack.addWidget(self._terminal)   # index 1
+        lay.addWidget(self._stack)
+        self._stack.setCurrentIndex(0)          # Rich UI default
+
+    def _on_mode_changed(self, idx: int) -> None:
+        self._stack.setCurrentIndex(idx)
+        self._active().setFocus()
+
+    def _on_history(self) -> None:
+        dlg = _HistoryDialog(self._rich._cwd, parent=self)
+        dlg.session_selected.connect(self._on_resume_session)
+        dlg.exec()
+
+    def _on_resume_session(self, session_id: str) -> None:
+        self._rich.resume_session(session_id)
+        self._mode.setCurrentIndex(0)   # switch to Rich UI if not already there
+        self._stack.setCurrentIndex(0)
+
+    def _on_new_session(self) -> None:
+        self._rich.clear()
+        self._mode.setCurrentIndex(0)
+        self._stack.setCurrentIndex(0)
+
+    def _on_permissions(self) -> None:
+        dlg = _PermissionDialog(self)
+        dlg.exec()  # saves on OK; cancelling discards changes
+
+    def _active(self):
+        return self._rich if self._mode.currentIndex() == 0 else self._terminal
+
+    # Routed to whichever mode is active -------------------------------------
+
+    def send_and_submit(self, text: str) -> None:
+        self._active().send_and_submit(text)
+
+    def set_input(self, text: str, grab_focus: bool = False) -> None:
+        self._active().set_input(text, grab_focus=grab_focus)
+
+    def closeEvent(self, a0) -> None:
+        for w in (self._rich, self._terminal):
+            try:
+                w.close()
+            except Exception:
+                pass
+        super().closeEvent(a0)
+
+
+# ---------------------------------------------------------------------------
 # Left pane — live editable transcript
 # ---------------------------------------------------------------------------
 
@@ -630,7 +1715,7 @@ class TranscriptPane(QWidget):
     source_changed = pyqtSignal(str)  # "microphone" or "zoom"
     load_all_clicked = pyqtSignal()
 
-    def __init__(self, terminal: TerminalPane, parent: QWidget | None = None) -> None:
+    def __init__(self, terminal: "LeftPane", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._terminal = terminal
         self._last_append: float = 0.0
@@ -825,6 +1910,35 @@ class TranscriptPane(QWidget):
         r_vol.addStretch()
         lay.addWidget(row_vol)
 
+        # ── Row N+2: Others volume ────────────────────────────────────────────
+        row_ovol = QWidget()
+        row_ovol.setFixedHeight(28)
+        row_ovol.setStyleSheet(_act_bg)
+        r_ovol = QHBoxLayout(row_ovol)
+        r_ovol.setContentsMargins(4, 3, 4, 3)
+        r_ovol.setSpacing(4)
+        ovol_lbl = QLabel("Others Vol:")
+        ovol_lbl.setStyleSheet("color:#555; font-size:11px;")
+        ovol_lbl.setFixedWidth(90)
+        r_ovol.addWidget(ovol_lbl)
+        self._others_vol_spin = QSpinBox()
+        self._others_vol_spin.setRange(0, 100)
+        self._others_vol_spin.setSuffix("%")
+        self._others_vol_spin.setValue(int(os.getenv("OTHERS_VOLUME", "50")))
+        self._others_vol_spin.setFixedHeight(22)
+        self._others_vol_spin.setFixedWidth(60)
+        self._others_vol_spin.setToolTip("Volume % when anyone other than the Interviewee is speaking")
+        self._others_vol_spin.setStyleSheet(
+            "QSpinBox{border:1px solid #bbb;border-radius:3px;padding:0 2px;"
+            "background:#fff;color:#333;font-size:11px;}"
+        )
+        self._others_vol_spin.valueChanged.connect(
+            lambda v: os.environ.__setitem__("OTHERS_VOLUME", str(v))
+        )
+        r_ovol.addWidget(self._others_vol_spin)
+        r_ovol.addStretch()
+        lay.addWidget(row_ovol)
+
         # ── Text area ────────────────────────────────────────────────────────
         self._edit = QTextEdit()
         self._edit.setFont(QFont("Helvetica Neue", 14))
@@ -841,31 +1955,6 @@ class TranscriptPane(QWidget):
         )
         self._edit.setPlaceholderText("Transcription will appear here in real-time…")
         lay.addWidget(self._edit)
-
-        # ── Question input row ───────────────────────────────────────────────
-        q_wrap = QWidget()
-        q_wrap.setStyleSheet("background:#f4f4f4; border-top:1px solid #d0d0d0;")
-        q_lay = QHBoxLayout(q_wrap)
-        q_lay.setContentsMargins(4, 4, 4, 4)
-        q_lay.setSpacing(4)
-        self._question_input = QLineEdit()
-        self._question_input.setPlaceholderText("Question + Enter…")
-        self._question_input.setFixedHeight(26)
-        self._question_input.setStyleSheet(
-            "QLineEdit{background:#fff;color:#1a1a1a;border:1px solid #bbb;"
-            "border-radius:4px;padding:0 6px;font-size:12px;}"
-            "QLineEdit:focus{border:1px solid #0078d4;}"
-        )
-        self._question_input.returnPressed.connect(self._on_send_to_claude)
-        q_lay.addWidget(self._question_input)
-        send_btn = _btn("Send", "Send transcript + question to Claude",
-                        "#0078d4", "#106ebe", "#005a9e")
-        send_btn.setFixedHeight(26)
-        send_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        send_btn.setFixedWidth(44)
-        send_btn.clicked.connect(self._on_send_to_claude)
-        q_lay.addWidget(send_btn)
-        lay.addWidget(q_wrap)
 
     def _on_dev_changed(self, name: str) -> None:
         os.environ["ZOOM_OUTPUT_DEVICE"] = "" if name == "(none)" else name.strip()
@@ -991,35 +2080,6 @@ class TranscriptPane(QWidget):
         only new entries (after the next Zoom save) will appear."""
         self._edit.clear()
         self._last_append = 0.0
-
-    def _on_send_to_claude(self) -> None:
-        """Combine transcript + question, send to Claude terminal, then reset transcript."""
-        import re as _re
-        transcript = self._edit.toPlainText().strip()
-        question = self._question_input.text().strip()
-
-        if not transcript and not question:
-            return
-
-        # Normalize transcript: collapse multiple whitespace/newlines into a
-        # single space so the whole thing lands on one terminal input line.
-        normalized = _re.sub(r"\s+", " ", transcript).strip()
-
-        if normalized and question:
-            message = f"{normalized} {question}"
-        elif normalized:
-            message = normalized
-        else:
-            message = question
-
-        self._terminal.send_and_submit(message)
-
-        # Clear transcript so the next capture starts fresh
-        self._edit.clear()
-        self._last_append = 0.0
-
-        # Clear the question field and return focus to the terminal
-        self._question_input.clear()
 
     def _on_save(self) -> None:
         text = self._edit.toPlainText().strip()
@@ -1173,7 +2233,7 @@ class App(QMainWindow):
         self.setFixedWidth(900)
         self.setStyleSheet("QMainWindow{background:#f0f0f0;}")
 
-        self._term = TerminalPane(repo_path=repo_path)
+        self._term = LeftPane(repo_path=repo_path)
         self._trans = TranscriptPane(terminal=self._term)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1212,9 +2272,11 @@ class App(QMainWindow):
         # Don't start the audio worker — Zoom is the default source
 
         self._zoom_watcher: _ZoomWatcher | None = None
-        self._restore_vol: int | None = None  # volume to restore when interviewee stops speaking
         self._trans.source_changed.connect(self._on_source_changed)
         self._trans.load_all_clicked.connect(self._on_load_all)
+        # Cached volume for status bar; refreshed at most once per 2 s via osascript.
+        self._current_vol: int = self._read_volume_osascript()
+        self._vol_cache_ts: float = 0.0
         # Start in Zoom mode immediately
         self._on_source_changed("zoom")
 
@@ -1379,15 +2441,30 @@ class App(QMainWindow):
         except Exception as exc:
             print(f"[volume] CoreAudio error: {exc}", flush=True)
 
-    def _get_system_volume(self) -> str:
-        """Return current volume for status bar display."""
+    def _read_volume_osascript(self) -> int:
+        """Read the actual system output volume via osascript."""
         try:
-            return str(self._read_volume())
+            result = subprocess.run(
+                ["osascript", "-e", "output volume of (get volume settings)"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return int(result.stdout.strip())
         except Exception:
-            return "—"
+            return self._current_vol if hasattr(self, "_current_vol") else 100
+
+    def _get_system_volume(self) -> str:
+        """Return current volume, re-reading from the OS at most once per 2 s."""
+        import time
+        now = time.monotonic()
+        if now - self._vol_cache_ts >= 2.0:
+            self._current_vol = self._read_volume_osascript()
+            self._vol_cache_ts = now
+        return str(self._current_vol)
 
     def _set_volume(self, vol_pct: int) -> None:
         """Set volume via CoreAudio (if device configured) or osascript fallback."""
+        self._current_vol = vol_pct
+        self._vol_cache_ts = 0.0  # force re-read on next status refresh
         device = os.getenv("ZOOM_OUTPUT_DEVICE", "").strip()
         if device:
             self._set_device_volume(device, vol_pct)
@@ -1400,38 +2477,17 @@ class App(QMainWindow):
             except Exception as exc:
                 print(f"[volume] osascript: {exc}", flush=True)
 
-    def _read_volume(self) -> int:
-        """Read current volume via CoreAudio (if device configured) or osascript fallback."""
-        device = os.getenv("ZOOM_OUTPUT_DEVICE", "").strip()
-        if device:
-            v = self._get_device_volume(device)
-            if v != "—":
-                try:
-                    return int(v)
-                except ValueError:
-                    pass
-        # osascript fallback
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", "output volume of (get volume settings)"],
-                capture_output=True, text=True, timeout=2,
-            )
-            return int(result.stdout.strip())
-        except Exception:
-            return 100
-
     def _on_speaker_changed_volume(self, speaker: str) -> None:
-        """Adjust volume based on who is speaking."""
+        """Adjust volume based on who is speaking.
+
+        Both volumes are explicitly configured via the UI: the Interviewee Vol
+        applies while the interviewee speaks, the Others Vol applies for anyone
+        else. We no longer snapshot/restore the prior system volume."""
         interviewee = os.getenv("INTERVIEWEE_SPEAKER_NAME", "Interviewee").strip()
         if speaker.strip().lower() == interviewee.lower():
-            # Save current volume before ducking
-            self._restore_vol = self._read_volume()
             vol = max(0, min(100, int(os.getenv("INTERVIEWEE_VOLUME", "5"))))
         else:
-            # Only restore if we previously ducked this session
-            if self._restore_vol is None:
-                return
-            vol = self._restore_vol
+            vol = max(0, min(100, int(os.getenv("OTHERS_VOLUME", "50"))))
         self._set_volume(vol)
         # Refresh status bar to reflect new volume
         from PyQt6.QtCore import QTimer
